@@ -17,6 +17,7 @@ services:
     build: apps/api
     environment:
       DATABASE_URL: postgresql://kt:kt@db:5432/kt
+      APP_DB_PASSWORD: kt_app_dev  # local development only; the API's limited login for client data
       # Any OpenAI-compatible server. Default: Ollama running on your Mac.
       # To change, put the same names in a .env file next to this one.
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}

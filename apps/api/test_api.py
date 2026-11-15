@@ -4,6 +4,7 @@ import os
 import uuid
 
 import httpx
+import psycopg
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,10 +28,23 @@ def fake_embed(texts):
     return vectors
 
 
+def session_of(email):
+    """A fresh session token for an account, as signing in would create."""
+    token, hashed = auth.new_token()
+    with admin_db() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token_hash, user_id, expires_at) "
+            "SELECT %s, id, now() + interval '1 hour' FROM users WHERE email = %s",
+            (hashed, email),
+        )
+    return token
+
+
 @pytest.fixture
 def world(monkeypatch):
     """Two companies. Acme has an admin, a member, and workspaces 'bank' and 'shop'. Rival has one admin."""
     monkeypatch.setattr(rag, "embed", fake_embed)
+    main._attempts.clear()  # every test client shares one address; rate limits count per test
     monkeypatch.setattr(rag, "chat", lambda system, user: "unused")
     monkeypatch.setattr(rag, "chat_stream", lambda system, user: iter(["Use make ", "restart [1]"]))
     tag = uuid.uuid4().hex[:8]
@@ -38,18 +52,20 @@ def world(monkeypatch):
     def client():
         return TestClient(main.app)
 
-    with client() as acme_admin, client() as acme_member, client() as rival, client() as anonymous:
-        assert acme_admin.post("/auth/signup", json={"email": f"lead-{tag}@acme.test", "password": "correct horse", "org_name": f"Acme {tag}"}).status_code == 200
-        assert rival.post("/auth/signup", json={"email": f"boss-{tag}@rival.test", "password": "correct horse", "org_name": f"Rival {tag}"}).status_code == 200
-        bank = acme_admin.post("/workspaces", json={"name": "bank"}).json()["id"]
-        shop = acme_admin.post("/workspaces", json={"name": "shop"}).json()["id"]
-        token = acme_admin.post("/invites", json={}).json()["token"]
-        assert acme_member.post("/auth/signup", json={"email": f"dev-{tag}@acme.test", "password": "correct horse", "invite": token}).status_code == 200
-        r = acme_admin.post(f"/workspaces/{bank}/documents", files={"file": ("runbook.md", b"# Deploy\nRestart the payment service with make restart.\n")})
-        assert r.json() == {"name": "runbook.md", "status": "ready", "chunks": 1}
-        yield {"admin": acme_admin, "member": acme_member, "rival": rival, "anonymous": anonymous, "bank": bank, "shop": shop, "tag": tag, "invite": token}
-    with admin_db() as conn:
-        conn.execute("DELETE FROM organisations WHERE name IN (%s, %s)", (f"Acme {tag}", f"Rival {tag}"))
+    try:
+        with client() as acme_admin, client() as acme_member, client() as rival, client() as anonymous:
+            assert acme_admin.post("/auth/signup", json={"email": f"lead-{tag}@acme.test", "password": "correct horse", "org_name": f"Acme {tag}"}).status_code == 200
+            assert rival.post("/auth/signup", json={"email": f"boss-{tag}@rival.test", "password": "correct horse", "org_name": f"Rival {tag}"}).status_code == 200
+            bank = acme_admin.post("/workspaces", json={"name": "bank"}).json()["id"]
+            shop = acme_admin.post("/workspaces", json={"name": "shop"}).json()["id"]
+            token = acme_admin.post("/invites", json={}).json()["token"]
+            assert acme_member.post("/auth/signup", json={"email": f"dev-{tag}@acme.test", "password": "correct horse", "invite": token}).status_code == 200
+            r = acme_admin.post(f"/workspaces/{bank}/documents", files={"file": ("runbook.md", b"# Deploy\nRestart the payment service with make restart.\n")})
+            assert r.json() == {"name": "runbook.md", "status": "ready", "chunks": 1}
+            yield {"admin": acme_admin, "member": acme_member, "rival": rival, "anonymous": anonymous, "bank": bank, "shop": shop, "tag": tag, "invite": token}
+    finally:  # also when setup failed half way
+        with admin_db() as conn:
+            conn.execute("DELETE FROM organisations WHERE name IN (%s, %s)", (f"Acme {tag}", f"Rival {tag}"))
 
 
 def ask(client, workspace_id, question, history=()):
@@ -104,19 +120,35 @@ def test_member_sees_only_assigned_workspaces(world):
 
 def test_database_itself_hides_other_companies_rows(world):
     """Even a query with no workspace filter returns nothing: this is row-level security, not API code."""
-    with admin_db() as conn:
-        rival_id = conn.execute("SELECT id FROM users WHERE email = %s", (f"boss-{world['tag']}@rival.test",)).fetchone()[0]
-        lead_id = conn.execute("SELECT id FROM users WHERE email = %s", (f"lead-{world['tag']}@acme.test",)).fetchone()[0]
-    with user_db(rival_id) as conn:
+    with user_db(session_of(f"boss-{world['tag']}@rival.test")) as conn:
         assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM workspace_members").fetchone()[0] == 0
         assert conn.execute("UPDATE chunks SET text = 'x'").rowcount == 0
         with pytest.raises(Exception):  # cannot plant a document in someone else's workspace
             conn.execute("INSERT INTO documents (workspace_id, name, sha256) VALUES (%s, 'x', 'x')", (world["bank"],))
-    with user_db(lead_id) as conn:
+    with user_db(session_of(f"lead-{world['tag']}@acme.test")) as conn:
         assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 1
-        with pytest.raises(Exception):  # the app role can never read password hashes
-            conn.execute("SELECT password_hash FROM users")
+
+
+def test_app_login_cannot_impersonate_or_read_accounts(world):
+    """Council finding S1: kt_app used to be able to set any user id itself. Now it needs a session token."""
+    with admin_db() as conn:
+        lead_id = conn.execute("SELECT id FROM users WHERE email = %s", (f"lead-{world['tag']}@acme.test",)).fetchone()[0]
+    with user_db(session_of(f"boss-{world['tag']}@rival.test")) as conn:
+        for name, value in (("app.user_id", str(lead_id)), ("app.session", "guessed-token"), ("app.session", "")):
+            conn.execute("SELECT set_config(%s, %s, true)", (name, value))
+            assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
+            assert conn.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 0
+    for table in ("users", "sessions", "invites", "organisations"):
+        with user_db(session_of(f"lead-{world['tag']}@acme.test")) as conn:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(f"SELECT * FROM {table} LIMIT 1")
+    with admin_db() as conn:  # an expired session opens nothing
+        conn.execute("UPDATE sessions SET expires_at = now() - interval '1 second' WHERE user_id = %s", (lead_id,))
+    with TestClient(main.app) as c:
+        c.cookies = world["admin"].cookies
+        assert c.get("/me").status_code == 401
 
 
 def test_login_logout_and_invite_rules(world):
@@ -287,7 +319,194 @@ def test_handover_notes_become_a_searchable_document(world):
 
 def test_guides_are_hidden_by_the_database_too(world):
     world["admin"].post(f"/workspaces/{world['bank']}/guide")
-    with admin_db() as conn:
-        rival_id = conn.execute("SELECT id FROM users WHERE email = %s", (f"boss-{world['tag']}@rival.test",)).fetchone()[0]
-    with user_db(rival_id) as conn:
+    with user_db(session_of(f"boss-{world['tag']}@rival.test")) as conn:
         assert conn.execute("SELECT count(*) FROM guides").fetchone()[0] == 0
+
+
+def test_plan_limits_stop_questions_uploads_and_new_people(world, monkeypatch):
+    admin, rival, bank = world["admin"], world["rival"], world["bank"]
+    monkeypatch.setitem(main.PLANS, "trial", {"questions": 1, "documents": 2, "people": 2})  # Acme has 2 people, 1 document
+
+    assert ask(admin, bank, "restart?")[0] == 200
+    status, body = ask(admin, bank, "restart again?")
+    assert status == 403 and "questions" in body["detail"]
+
+    assert admin.post(f"/workspaces/{bank}/documents", files={"file": ("two.md", b"# Two\nsecond document\n")}).status_code == 200
+    r = admin.post(f"/workspaces/{bank}/documents", files={"file": ("three.md", b"# Three\nthird document\n")})
+    assert r.status_code == 403 and "documents" in r.json()["detail"]
+
+    assert admin.post("/invites", json={}).status_code == 403
+
+    usage = admin.get("/usage").json()
+    assert usage == {"plan": "trial", "used": {"questions": 1, "documents": 2, "people": 2}, "limits": main.PLANS["trial"]}
+    assert world["member"].get("/usage").status_code == 403
+    assert rival.get("/usage").json()["used"] == {"questions": 0, "documents": 0, "people": 1}  # counted per company
+
+
+def test_invite_is_kept_when_the_company_is_full(world, monkeypatch):
+    admin, tag = world["admin"], world["tag"]
+    token = admin.post("/invites", json={}).json()["token"]
+    monkeypatch.setitem(main.PLANS, "trial", {"questions": 9, "documents": 9, "people": 2})
+    with TestClient(main.app) as c:
+        r = c.post("/auth/signup", json={"email": f"new-{tag}@acme.test", "password": "correct horse", "invite": token})
+        assert r.status_code == 403
+        monkeypatch.setitem(main.PLANS, "trial", {"questions": 9, "documents": 9, "people": 3})
+        assert c.post("/auth/signup", json={"email": f"new-{tag}@acme.test", "password": "correct horse", "invite": token}).status_code == 200
+
+
+def test_set_plan_command(world):
+    import admin as admin_cli
+
+    result = admin_cli.set_plan(f"LEAD-{world['tag']}@acme.test", "team")
+    assert result["plan"] == "team" and result["limits"] == main.PLANS["team"]
+    with pytest.raises(SystemExit):
+        admin_cli.set_plan(f"lead-{world['tag']}@acme.test", "platinum")
+
+
+def test_unexpected_errors_are_logged_alerted_and_hidden(world, monkeypatch):
+    sent = []
+    monkeypatch.setattr(main, "ALERT_WEBHOOK_URL", "https://hooks.example/alert")
+    monkeypatch.setattr(main, "_last_alert", -main.ALERT_EVERY_SECONDS)
+    monkeypatch.setattr(main.httpx, "post", lambda url, json, timeout: sent.append(json))
+
+    def broken(*a, **k):
+        raise RuntimeError("secret detail")
+
+    monkeypatch.setattr(rag, "search", broken)
+    with TestClient(main.app, raise_server_exceptions=False) as c:
+        c.cookies = world["admin"].cookies
+        for _ in range(2):
+            r = c.post(f"/workspaces/{world['bank']}/ask", json={"question": "restart?"})
+            assert r.status_code == 500 and "secret" not in r.text
+    assert len(sent) == 1  # the second error within a minute is not sent again
+    assert "RuntimeError" in sent[0]["text"] and "secret" not in sent[0]["text"]
+
+
+def test_app_login_cannot_switch_role(world):
+    with admin_db() as conn:
+        owner = conn.execute("SELECT current_user").fetchone()[0]
+    with user_db(session_of(f"lead-{world['tag']}@acme.test")) as conn:
+        assert conn.execute("SELECT current_user").fetchone()[0] == "kt_app"
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute(f'SET ROLE "{owner}"')
+
+
+def test_admin_can_delete_a_document_members_cannot(world):
+    admin, member, rival, bank = world["admin"], world["member"], world["rival"], world["bank"]
+    member_id = next(m["id"] for m in admin.get("/team").json() if m["role"] == "member")
+    admin.put(f"/workspaces/{bank}/members/{member_id}")
+    doc_id = admin.get(f"/workspaces/{bank}/documents").json()[0]["id"]
+
+    assert member.delete(f"/workspaces/{bank}/documents/{doc_id}").status_code == 403
+    assert rival.delete(f"/workspaces/{bank}/documents/{doc_id}").status_code == 404
+    assert admin.delete(f"/workspaces/{world['shop']}/documents/{doc_id}").status_code == 404  # wrong workspace
+    assert admin.delete(f"/workspaces/{bank}/documents/{doc_id}").status_code == 200
+    assert admin.get(f"/workspaces/{bank}/documents").json() == []
+    _, lines = ask(admin, bank, "how do I restart the service?")
+    assert lines[0]["sources"] == []  # its chunks went with it
+
+
+def test_changing_the_embedding_model_lets_documents_load_again(world, monkeypatch):
+    admin, bank = world["admin"], world["bank"]
+    runbook = b"# Deploy\nRestart the payment service with make restart.\n"
+    monkeypatch.setattr(rag, "EMBED_MODEL", "another-model")
+    r = admin.post(f"/workspaces/{bank}/documents", files={"file": ("runbook.md", runbook)})
+    assert r.json()["status"] == "ready"  # not "duplicate": the old chunks were for the old model
+    assert [d["name"] for d in admin.get(f"/workspaces/{bank}/documents").json()] == ["runbook.md"]
+    _, lines = ask(admin, bank, "how do I restart the service?")
+    assert lines[0]["sources"][0]["document"] == "runbook.md"
+
+
+def test_admin_removes_a_person_who_is_then_signed_out(world):
+    admin, member, rival, tag = world["admin"], world["member"], world["rival"], world["tag"]
+    people = admin.get("/team").json()
+    me = next(p for p in people if p["you"])
+    member_id = next(p["id"] for p in people if p["role"] == "member")
+
+    assert member.delete(f"/team/{me['id']}").status_code == 403
+    assert rival.delete(f"/team/{member_id}").status_code == 404
+    assert admin.delete(f"/team/{me['id']}").status_code == 400
+    assert admin.delete(f"/team/{member_id}").status_code == 200
+    assert member.get("/me").status_code == 401
+    assert [p["email"] for p in admin.get("/team").json()] == [f"lead-{tag}@acme.test"]
+
+
+def test_bad_uploads_get_a_clear_400(world):
+    admin, bank = world["admin"], world["bank"]
+    r = admin.post(f"/workspaces/{bank}/documents", files={"file": ("broken.pdf", b"%PDF-1.4 not really")})
+    assert r.status_code == 400 and "could not read" in r.json()["detail"]
+
+
+def test_mid_stream_crash_ends_with_an_error_line(world, monkeypatch):
+    def broken(system, user):
+        yield "Use make "
+        raise KeyError("choices")
+
+    monkeypatch.setattr(rag, "chat_stream", broken)
+    status, lines = ask(world["admin"], world["bank"], "how do I restart the service?")
+    assert status == 200 and "failed part way" in lines[-1]["error"]
+
+
+def test_guide_needs_documents_and_orders_reading_by_citation(world, monkeypatch):
+    admin, bank, shop = world["admin"], world["bank"], world["shop"]
+    assert admin.post(f"/workspaces/{shop}/guide").status_code == 400  # empty workspace
+    admin.post(f"/workspaces/{bank}/documents", files={"file": ("config.md", b"# Config\nRestart settings live in config.\n")})
+    monkeypatch.setattr(rag, "chat_stream", lambda s, u: iter(["Settings [2]. Restart [1]."]))
+    lines = [json.loads(line) for line in admin.post(f"/workspaces/{bank}/guide").text.splitlines()]
+    sources = {s["n"]: s["document"] for s in lines[0]["section"]["sources"]}
+    assert lines[-1]["reading_order"] == [sources[2], sources[1]]
+
+
+def test_handover_counts_against_the_document_limit(world, monkeypatch):
+    monkeypatch.setitem(main.PLANS, "trial", {"questions": 9, "documents": 1, "people": 9})  # Acme has 1 document
+    r = world["admin"].post(f"/workspaces/{world['bank']}/handover", json={"answers": [{"question": "q", "answer": "a"}]})
+    assert r.status_code == 403
+
+
+def test_questions_from_last_month_do_not_count(world):
+    ask(world["admin"], world["bank"], "restart?")
+    with admin_db() as conn:
+        conn.execute("UPDATE messages SET created_at = date_trunc('month', now()) - interval '1 second' "
+                     "WHERE workspace_id = %s", (world["bank"],))
+    assert world["admin"].get("/usage").json()["used"]["questions"] == 0
+
+
+def test_password_guessing_is_slowed_down_without_locking_out_the_owner(world):
+    email = f"lead-{world['tag']}@acme.test"
+    with TestClient(main.app, client=("203.0.113.9", 4000)) as attacker:
+        codes = [attacker.post("/auth/login", json={"email": email, "password": "wrong password"}).status_code for _ in range(11)]
+        assert codes == [401] * 10 + [429]
+        assert attacker.post("/auth/login", json={"email": email, "password": "correct horse"}).status_code == 429
+    with TestClient(main.app, client=("198.51.100.7", 4000)) as owner:  # the real owner, elsewhere
+        assert owner.post("/auth/login", json={"email": email, "password": "correct horse"}).status_code == 200
+        for _ in range(12):  # successful sign-ins are not counted as guesses
+            assert owner.post("/auth/login", json={"email": email, "password": "correct horse"}).status_code == 200
+
+
+def test_temporary_tables_cannot_stand_in_for_sessions_or_users(world):
+    """Council re-check: kt_app made temp tables named sessions and users so the lookup functions read them."""
+    with admin_db() as conn:
+        acme_org = conn.execute("SELECT org_id FROM users WHERE email = %s", (f"lead-{world['tag']}@acme.test",)).fetchone()[0]
+    with user_db(session_of(f"boss-{world['tag']}@rival.test")) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("CREATE TEMP TABLE sessions (token_hash text, user_id bigint, expires_at timestamptz)")
+    with admin_db() as conn:  # even if a temp table did exist, the functions read the real ones
+        conn.execute("CREATE TEMP TABLE users (id bigint, org_id bigint, role text)")
+        conn.execute("INSERT INTO users VALUES (1, %s, 'admin')", (acme_org,))
+        conn.execute("SELECT set_config('app.session', 'nothing', true)")
+        assert conn.execute("SELECT kt_org_id(), kt_is_admin()").fetchone() == (None, False)
+
+
+def test_database_lets_only_admins_delete(world):
+    admin, bank = world["admin"], world["bank"]
+    member_id = next(m["id"] for m in admin.get("/team").json() if m["role"] == "member")
+    admin.put(f"/workspaces/{bank}/members/{member_id}")
+    with user_db(session_of(f"dev-{world['tag']}@acme.test")) as conn:  # a member, with raw SQL
+        assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == 1  # can read
+        assert conn.execute("DELETE FROM chunks").rowcount == 0
+        assert conn.execute("DELETE FROM documents").rowcount == 0
+        assert conn.execute("DELETE FROM workspaces").rowcount == 0
+        assert conn.execute("DELETE FROM workspace_members").rowcount == 0
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("INSERT INTO guides (workspace_id, sections, reading_order) VALUES (%s, '[]', '[]')", (bank,))
+    assert len(admin.get(f"/workspaces/{bank}/documents").json()) == 1

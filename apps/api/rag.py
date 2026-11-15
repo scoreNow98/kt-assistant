@@ -17,15 +17,27 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gemma3:4b")
 
 SUFFIXES = {".md", ".mdx", ".txt", ".pdf", ".docx"}
 NOT_FOUND = "I could not find this in the documents."
-CITED = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")  # [1] or [1, 3]
+CITED = re.compile(r"\[(?:Sources? )?(\d+(?:\s*,\s*\d+)*)\]")  # [1], [1, 3], [Source 1]
+MAX_CHUNKS_PER_DOCUMENT = 2000
+# What the model reads per question. Ollama's default context on most machines is about 4k tokens;
+# ~10k characters of sources plus the prompt fits in 8k (set OLLAMA_CONTEXT_LENGTH=8192, see README).
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "10000"))
 HEADING = re.compile(r"#{1,6}\s+(.+?)(?:\s*\{\s*#[^}]*\})?\s*$")  # drops a trailing {#anchor}
 
 
 def extract(name: str, data: bytes) -> list[tuple[int | None, str]]:
-    """Returns (page number or None, text) parts of a file."""
+    """Returns (page number or None, text) parts of a file. Any file it cannot read raises ValueError."""
     suffix = Path(name).suffix.lower()
     if suffix not in SUFFIXES:
         raise ValueError(f"unsupported file type: {suffix or name}")
+    try:
+        parts = _extract(suffix, data)
+    except Exception as e:  # corrupt, encrypted or mislabelled files: the parsers raise many kinds of errors
+        raise ValueError("could not read this file. Scanned or password-protected PDFs are not supported yet.") from e
+    return [(page, text.replace("\x00", "")) for page, text in parts]  # Postgres text cannot hold NUL
+
+
+def _extract(suffix: str, data: bytes) -> list[tuple[int | None, str]]:
     if suffix == ".pdf":
         from pypdf import PdfReader
 
@@ -34,11 +46,17 @@ def extract(name: str, data: bytes) -> list[tuple[int | None, str]]:
     if suffix == ".docx":
         from docx import Document
 
+        doc = Document(io.BytesIO(data))
         lines = []
-        for p in Document(io.BytesIO(data)).paragraphs:
+        for p in doc.paragraphs:
             is_heading = p.style.name.startswith("Heading")
             lines.append(f"# {p.text}" if is_heading and p.text.strip() else p.text)
+        # shortcut: tables come after all paragraphs, not in their place in the document.
+        for table in doc.tables:
+            lines += [" | ".join(cell.text.strip() for cell in row.cells) for row in table.rows]
         return [(None, "\n\n".join(lines))]
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):  # UTF-16, as Windows Notepad sometimes saves
+        return [(None, data.decode("utf-16", errors="replace"))]
     return [(None, data.decode("utf-8", errors="replace"))]
 
 
@@ -130,11 +148,21 @@ def ingest(conn, workspace_id: int, name: str, data: bytes) -> dict:
     ]
     if not pieces:
         raise ValueError("no readable text in this file (scanned PDFs are not supported yet)")
+    if len(pieces) > MAX_CHUNKS_PER_DOCUMENT:
+        raise ValueError(f"this file is too long ({len(pieces)} sections). Split it into smaller files.")
     # The caller's transaction covers all of this: a failed embedding leaves nothing behind.
+    sha256 = hashlib.sha256(data).hexdigest()
+    # The same file again is a duplicate, unless it was embedded with another model: then embed it afresh.
+    # (Removing the old copy needs an admin, as all deletes do; for a member it stays a duplicate.)
+    conn.execute(
+        "DELETE FROM documents d WHERE workspace_id = %s AND sha256 = %s "
+        "AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id AND c.embed_model = %s)",
+        (workspace_id, sha256, EMBED_MODEL),
+    )
     row = conn.execute(
         "INSERT INTO documents (workspace_id, name, sha256) VALUES (%s, %s, %s) "
         "ON CONFLICT DO NOTHING RETURNING id",
-        (workspace_id, name, hashlib.sha256(data).hexdigest()),
+        (workspace_id, name, sha256),
     ).fetchone()
     if row is None:
         return {"name": name, "status": "duplicate", "chunks": 0}
@@ -195,6 +223,28 @@ def search(conn, workspace_id: int, question: str, k: int = 8, keyword: bool = T
     ]
 
 
+def fit(sources: list[dict]) -> list[dict]:
+    """The best-ranked sources that fit in MAX_CONTEXT_CHARS (always at least one), so the model reads
+    every source it is shown and the page lists only those."""
+    kept, used = [], 0
+    for s in sources:
+        used += len(s["text"]) + len(s["heading"]) + len(s["document"]) + 10
+        if kept and used > MAX_CONTEXT_CHARS:
+            break
+        kept.append(s)
+    return kept
+
+
+def cited_order(answer: str) -> list[int]:
+    """Source numbers in the order the answer first cites them."""
+    order = []
+    for group in CITED.findall(answer):
+        for n in group.split(","):
+            if int(n) not in order:
+                order.append(int(n))
+    return order
+
+
 def rewrite(question: str, history: list[dict]) -> str:
     """Turns a follow-up ("and how do I restart it?") into a question that stands on its own."""
     if not history:
@@ -216,7 +266,7 @@ def answer_stream(sources: list[dict], question: str):
         return
     system = (
         "You answer questions for a software team using only the numbered sources below. "
-        "Put the source number right after each sentence it supports, like this [1]. "
+        "Put the source number right after each sentence it supports, like this [1], or [1, 2] for two. "
         "Never list source numbers at the start of the answer. "
         f"If the sources do not contain the answer, reply exactly: {NOT_FOUND}"
     )

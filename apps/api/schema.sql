@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS organisations (
   name text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+-- Limits per plan are in main.py (PLANS). Change a company's plan with: python admin.py set-plan
+ALTER TABLE organisations ADD COLUMN IF NOT EXISTS plan text NOT NULL DEFAULT 'trial';
 
 -- shortcut: a user belongs to exactly one organisation; move org_id and role to a join table if someone needs two.
 CREATE TABLE IF NOT EXISTS users (
@@ -105,35 +107,75 @@ CREATE TABLE IF NOT EXISTS guides (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- Row-level security: client data is read and written as the role kt_app, which only sees
--- workspaces the current user (app.user_id) may open. The API code filters too; this is the second lock.
+-- Row-level security: client data is read and written by the kt_app login, which only sees workspaces
+-- the signed-in person may open. The API filters too; this is the second lock.
+--
+-- Who is signed in comes from the session token the API puts in app.session, checked against the
+-- sessions table by the functions below. kt_app cannot read sessions or users itself, so even code
+-- that runs arbitrary SQL as kt_app can only act as a person whose secret session token it holds.
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'kt_app') THEN
     CREATE ROLE kt_app NOLOGIN;
   END IF;
 END $$;
 
+-- SECURITY DEFINER: these run as the table owner, so they can read sessions and users on kt_app's behalf.
+-- Tables are named with public. and pg_temp is searched last, so a temporary table cannot stand in for them.
+CREATE OR REPLACE FUNCTION kt_user_id() RETURNS bigint
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT user_id FROM public.sessions
+  WHERE token_hash = encode(sha256(convert_to(current_setting('app.session', true), 'UTF8')), 'hex')
+    AND expires_at > now()
+$$;
+
+CREATE OR REPLACE FUNCTION kt_org_id() RETURNS bigint
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT org_id FROM public.users WHERE id = public.kt_user_id()
+$$;
+
+CREATE OR REPLACE FUNCTION kt_is_admin() RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT coalesce((SELECT role = 'admin' FROM public.users WHERE id = public.kt_user_id()), false)
+$$;
+
+CREATE OR REPLACE FUNCTION kt_is_member(ws bigint) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT EXISTS (SELECT 1 FROM public.workspace_members WHERE workspace_id = ws AND user_id = public.kt_user_id())
+$$;
+
+CREATE OR REPLACE FUNCTION kt_in_my_org(person bigint) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+  SELECT EXISTS (SELECT 1 FROM public.users WHERE id = person AND org_id = public.kt_org_id())
+$$;
+
+REVOKE ALL ON FUNCTION kt_user_id(), kt_org_id(), kt_is_admin(), kt_is_member(bigint), kt_in_my_org(bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION kt_user_id(), kt_org_id(), kt_is_admin(), kt_is_member(bigint), kt_in_my_org(bigint) TO kt_app;
+
 GRANT SELECT, INSERT, UPDATE, DELETE ON workspaces, workspace_members, documents, chunks, messages, guides TO kt_app;
-GRANT SELECT (id, email, org_id, role) ON users TO kt_app;  -- never the password hash
+REVOKE ALL ON organisations, users, sessions, invites FROM kt_app;  -- phase 2-5 granted some user columns
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO kt_app;
+DO $$ BEGIN
+  EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
+END $$;
 
 ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE guides ENABLE ROW LEVEL SECURITY;
 
--- Same organisation, and either an admin or a member of that workspace.
+-- Same organisation, and either an admin or a member of that workspace. Reads the row's own values, so it
+-- also decides which new workspaces may be created (admins, in their own organisation).
 DROP POLICY IF EXISTS workspace_access ON workspaces;
-CREATE POLICY workspace_access ON workspaces USING (
-  EXISTS (
-    SELECT 1 FROM users u
-    WHERE u.id = current_setting('app.user_id', true)::bigint
-      AND u.org_id = workspaces.org_id
-      AND (u.role = 'admin' OR EXISTS (
-        SELECT 1 FROM workspace_members m WHERE m.workspace_id = workspaces.id AND m.user_id = u.id))
-  )
-);
+CREATE POLICY workspace_access ON workspaces
+  USING (org_id = kt_org_id() AND (kt_is_admin() OR kt_is_member(id)))
+  WITH CHECK (org_id = kt_org_id() AND kt_is_admin());
+
+DROP POLICY IF EXISTS membership_access ON workspace_members;
+CREATE POLICY membership_access ON workspace_members
+  USING (workspace_id IN (SELECT id FROM workspaces))
+  WITH CHECK (kt_is_admin() AND workspace_id IN (SELECT id FROM workspaces) AND kt_in_my_org(user_id));
 
 DROP POLICY IF EXISTS document_access ON documents;
 CREATE POLICY document_access ON documents USING (workspace_id IN (SELECT id FROM workspaces));
@@ -144,8 +186,22 @@ CREATE POLICY chunk_access ON chunks USING (workspace_id IN (SELECT id FROM work
 -- People see only their own questions, and only in workspaces they can still open.
 DROP POLICY IF EXISTS message_access ON messages;
 CREATE POLICY message_access ON messages USING (
-  user_id = current_setting('app.user_id', true)::bigint AND workspace_id IN (SELECT id FROM workspaces)
+  user_id = kt_user_id() AND workspace_id IN (SELECT id FROM workspaces)
 );
 
 DROP POLICY IF EXISTS guide_access ON guides;
 CREATE POLICY guide_access ON guides USING (workspace_id IN (SELECT id FROM workspaces));
+
+-- Deleting, and writing the guide, are for admins only, here as well as in the API.
+DROP POLICY IF EXISTS admin_delete ON workspaces;
+CREATE POLICY admin_delete ON workspaces AS RESTRICTIVE FOR DELETE USING (kt_is_admin());
+DROP POLICY IF EXISTS admin_delete ON workspace_members;
+CREATE POLICY admin_delete ON workspace_members AS RESTRICTIVE FOR DELETE USING (kt_is_admin());
+DROP POLICY IF EXISTS admin_delete ON documents;
+CREATE POLICY admin_delete ON documents AS RESTRICTIVE FOR DELETE USING (kt_is_admin());
+DROP POLICY IF EXISTS admin_delete ON chunks;
+CREATE POLICY admin_delete ON chunks AS RESTRICTIVE FOR DELETE USING (kt_is_admin());
+DROP POLICY IF EXISTS admin_insert ON guides;
+CREATE POLICY admin_insert ON guides AS RESTRICTIVE FOR INSERT WITH CHECK (kt_is_admin());
+DROP POLICY IF EXISTS admin_update ON guides;
+CREATE POLICY admin_update ON guides AS RESTRICTIVE FOR UPDATE USING (kt_is_admin());

@@ -1,0 +1,14 @@
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+# The browser calls the API on the same domain, under /api (see infra/Caddyfile).
+ENV NEXT_PUBLIC_API_URL=/api
+RUN npm run build
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app ./
+CMD ["npm", "start"]

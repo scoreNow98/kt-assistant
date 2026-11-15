@@ -1,0 +1,23 @@
+# Caddy gets and renews the HTTPS certificate for DOMAIN by itself.
+{$DOMAIN} {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Frame-Options DENY
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+	# Uploads are capped at 20 MB by the API; refuse anything far bigger before it reaches it.
+	request_body {
+		max_size 25MB
+	}
+	handle_path /api/* {
+		# Answers stream line by line; send each line on at once instead of buffering.
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+	handle {
+		encode gzip
+		reverse_proxy web:3000
+	}
+}

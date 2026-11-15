@@ -1,0 +1,75 @@
+# Production: one server, HTTPS by Caddy, web and API on one domain (the API under /api).
+#   cp .env.example .env   # then fill it in
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Add --profile local-models to run Ollama on the same server instead of a hosted model API.
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kt
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_DB: kt
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kt"]
+      interval: 5s
+      retries: 20
+
+  api:
+    build: apps/api
+    restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    environment:
+      DATABASE_URL: postgresql://kt:${DB_PASSWORD}@db:5432/kt
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+      LLM_BASE_URL: ${LLM_BASE_URL:?set LLM_BASE_URL in .env}
+      LLM_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+      EMBED_MODEL: ${EMBED_MODEL:?set EMBED_MODEL in .env}
+      CHAT_MODEL: ${CHAT_MODEL:?set CHAT_MODEL in .env}
+      WEB_ORIGIN: https://${DOMAIN}
+      COOKIE_SECURE: "1"
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: apps/web
+      dockerfile: Dockerfile.prod
+    restart: unless-stopped
+    environment:
+      API_URL: http://api:8000
+    depends_on:
+      - api
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - web
+      - api
+
+  ollama:
+    profiles: ["local-models"]
+    image: ollama/ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "8192"  # the default 4k cuts off the sources sent with each question
+    volumes:
+      - ollama:/root/.ollama
+
+volumes:
+  dbdata:
+  caddy_data:
+  ollama:

@@ -19,8 +19,16 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   } catch {
     throw new ApiError(0, "Cannot reach the server. Check that it is running, then try again.");
   }
-  if (!res.ok) throw await errorFrom(res);
+  if (!res.ok) {
+    signOutIfExpired(res, path);
+    throw await errorFrom(res);
+  }
   return (await res.json().catch(() => ({}))) as T;
+}
+
+/** A session that expired while the page was open: reload, which shows the sign-in page. */
+function signOutIfExpired(res: Response, path: string) {
+  if (res.status === 401 && path !== "/me" && !path.startsWith("/auth/")) window.location.reload();
 }
 
 async function errorFrom(res: Response): Promise<ApiError> {
@@ -37,18 +45,28 @@ export async function stream(path: string, body: unknown, onLine: (line: Record<
   } catch {
     throw new ApiError(0, "Cannot reach the server. Check that it is running, then try again.");
   }
-  if (!res.ok || !res.body) throw await errorFrom(res);
+  if (!res.ok || !res.body) {
+    signOutIfExpired(res, path);
+    throw await errorFrom(res);
+  }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let finished = false;
   for (;;) {
     const { done, value } = await reader.read();
     buffer += decoder.decode(value, { stream: !done });
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
-    for (const line of lines) if (line.trim()) onLine(JSON.parse(line));
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const parsed = JSON.parse(line);
+      if ("done" in parsed || "error" in parsed) finished = true;
+      onLine(parsed);
+    }
     if (done) break;
   }
+  if (!finished) throw new ApiError(0, "The connection closed before the answer finished. Try again.");
 }
 
 export const post = (body: unknown): RequestInit => ({ method: "POST", body: JSON.stringify(body) });

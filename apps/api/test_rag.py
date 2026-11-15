@@ -56,3 +56,42 @@ def test_chat_stream_reads_server_sent_events(monkeypatch):
 def test_keywords_keep_only_word_characters():
     assert rag._keywords("Why does E1234 & allow_origins :* fail?") == "Why | does | E1234 | allow_origins | fail"
     assert rag._keywords("कैसे चलाएं?") == "कैसे | चलाएं"
+
+
+def test_unreadable_files_raise_value_error_not_a_crash():
+    import pytest
+
+    for name, data in [("broken.pdf", b"%PDF-1.4 not really"), ("broken.docx", b"PK\x03\x04 nope")]:
+        with pytest.raises(ValueError):
+            rag.extract(name, data)
+
+
+def test_utf16_and_nul_bytes_are_read_as_text():
+    assert rag.extract("notes.txt", "Restart with make restart".encode("utf-16")) == [(None, "Restart with make restart")]
+    assert rag.extract("notes.txt", b"a\x00b") == [(None, "ab")]
+
+
+def test_docx_tables_are_kept():
+    import io
+
+    from docx import Document
+
+    doc = Document()
+    doc.add_heading("Owners", level=1)
+    table = doc.add_table(rows=1, cols=2)
+    table.rows[0].cells[0].text, table.rows[0].cells[1].text = "billing", "Priya"
+    buf = io.BytesIO()
+    doc.save(buf)
+    text = rag.extract("owners.docx", buf.getvalue())[0][1]
+    assert "# Owners" in text and "billing | Priya" in text
+
+
+def test_fit_keeps_best_sources_within_budget(monkeypatch):
+    monkeypatch.setattr(rag, "MAX_CONTEXT_CHARS", 1000)
+    sources = [{"n": i, "document": "d.md", "heading": "h", "text": "x" * 400} for i in range(1, 9)]
+    assert [s["n"] for s in rag.fit(sources)] == [1, 2]
+    assert [s["n"] for s in rag.fit([{"n": 1, "document": "d", "heading": "h", "text": "x" * 5000}])] == [1]
+
+
+def test_cited_order_follows_the_text():
+    assert rag.cited_order("First [3]. Then [1, 3]. Also [Source 2].") == [3, 1, 2]

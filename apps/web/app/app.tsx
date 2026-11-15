@@ -164,7 +164,25 @@ function SignIn({ onDone }: { onDone: () => void }) {
       <div className="pitch">
         <p className="brand">KT Assistant</p>
         <h1>Ask the project. Read the source.</h1>
-        <p>Every client keeps its own workspace. Every answer points to the page it came from.</p>
+        <p>Knowledge transfer for service teams. One workspace per client, built from the documents you already have.</p>
+        <dl className="features">
+          <div>
+            <dt>Ask</dt>
+            <dd>Answers are written from that client's documents and cite the passages they used, so you can check them.</dd>
+          </div>
+          <div>
+            <dt>Start here</dt>
+            <dd>A new joiner gets a cited guide and a reading order on day one.</dd>
+          </div>
+          <div>
+            <dt>Gaps and handover</dt>
+            <dd>See what the documents never covered, and capture it from the person who knows before they leave.</dd>
+          </div>
+          <div>
+            <dt>Walls between clients</dt>
+            <dd>People see only the clients they work on. The database enforces it, not just the app.</dd>
+          </div>
+        </dl>
       </div>
       <form onSubmit={submit}>
         <h2>{joining ? "Join your team" : mode === "signup" ? "Create your company account" : "Sign in"}</h2>

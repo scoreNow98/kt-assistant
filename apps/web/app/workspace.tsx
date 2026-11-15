@@ -29,7 +29,7 @@ export default function WorkspaceView({ workspace, isAdmin }: { workspace: Works
       ))}
     </nav>
   );
-  if (view === "ask") return <Chat workspace={workspace} nav={nav} />;
+  if (view === "ask") return <Chat workspace={workspace} nav={nav} isAdmin={isAdmin} />;
   return (
     <div className="panel">
       <header>

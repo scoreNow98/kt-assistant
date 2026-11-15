@@ -2,7 +2,7 @@
 
 Knowledge-transfer assistant for service teams: one workspace per client, answers with links to the source document.
 
-Status: **phase 4, knowledge transfer**. Each client workspace has four tabs:
+Status: **phase 5, ready for a first paying pilot** (billing not built yet). Each client workspace has four tabs:
 
 - **Ask:** questions answered from the documents, with sources beside each answer (phase 3).
 - **Start here:** an onboarding guide an admin creates in one click: five cited sections and a reading order.
@@ -17,6 +17,12 @@ Status: **phase 4, knowledge transfer**. Each client workspace has four tabs:
 ```bash
 ollama pull bge-m3      # embeddings, multilingual
 ollama pull gemma3:4b   # answers
+```
+
+   Then give Ollama room for the sources sent with each question (its default is about 4k tokens, which cuts them off), and quit and reopen the Ollama app:
+
+```bash
+launchctl setenv OLLAMA_CONTEXT_LENGTH 8192
 ```
 
 3. Download the sample documents. Two open-source projects stand in for two clients; no company data is used.
@@ -48,7 +54,7 @@ Reload the page, open `client-a` and ask, for example, "How do I allow requests 
 - A **member** sees only the workspaces an admin ticked for them.
 - Another company sees nothing. This is enforced twice: in the API, and in Postgres itself with row-level security (`apps/api/schema.sql`).
 
-Invites are links the admin copies and sends; the app does not send email.
+Invites are links the admin copies and sends; the app does not send email. Admins can remove a document (in the document list of a workspace) and remove a person (under "Team and access"); a removed person is signed out at once.
 
 ## Check
 
@@ -73,14 +79,59 @@ Documents embedded with one embedding model are not searched with another, so re
 ## Layout
 
 ```
-apps/api/     FastAPI backend: main.py routes, auth.py logins, db.py connections, rag.py search and answers
+apps/api/     FastAPI backend: main.py routes, auth.py logins, db.py connections, rag.py search and answers, admin.py operator commands
 apps/web/     Next.js frontend
-infra/        database setup
+infra/        database setup and the production Caddy config
 scripts/      helper scripts
 ```
 
 `eval.py` prints two scores: vector search alone, and the hybrid search the app uses. The last 10 questions are harder on purpose: exact setting names and loosely worded questions.
 
-## Next: phase 5
+## Plans and limits
 
-Make it sellable: usage limits per company, billing, a landing page, cloud deployment, error alerts and backups.
+Each company has a plan with a monthly question limit and limits on documents and people (`PLANS` in `apps/api/main.py`; the numbers are placeholders until pricing is set). Admins see usage under "Team and access". Until billing exists, change a company's plan by hand:
+
+```bash
+docker compose exec api python admin.py usage someone@company.com
+docker compose exec api python admin.py set-plan someone@company.com team
+```
+
+## Deploy to a server
+
+Any Linux server with Docker works, for example a small VM. Point a domain's DNS A record at it, then on the server:
+
+```bash
+git clone https://github.com/scoreNow98/kt-assistant.git && cd kt-assistant
+cp .env.example .env   # fill in DOMAIN, the two passwords and the model API
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+Caddy gets an HTTPS certificate for the domain by itself. The web app and the API share the domain; the API is under `/api`.
+
+Models: a hosted OpenAI-compatible API is the easy choice. To keep everything free and on the server instead, add `--profile local-models` to run Ollama there (needs about 8 GB of memory free), set the model lines in `.env` as shown in `.env.example`, then pull the models once:
+
+```bash
+docker compose -f docker-compose.prod.yml exec ollama ollama pull bge-m3
+docker compose -f docker-compose.prod.yml exec ollama ollama pull gemma3:4b
+```
+
+## Alerts, logs and backups
+
+- **Alerts:** set `ALERT_WEBHOOK_URL` to a Slack, Google Chat or Discord incoming webhook. Server errors and model-server outages are posted there, at most once a minute.
+- **Logs:** `docker compose -f docker-compose.prod.yml logs -f api`
+- **Backups:** `./scripts/backup.sh docker-compose.prod.yml` saves the database to `backups/` and keeps the newest 14. Run it daily with cron (the line is at the top of the script) and copy `backups/` off the server.
+- **Restore:** `./scripts/restore.sh backups/<file>.sql.gz docker-compose.prod.yml` replaces all data with that backup after asking you to confirm.
+
+## Known limits
+
+From the review of phase 5 (security, correctness and accuracy), still open:
+
+- Answers are grounded by the prompt only. The model always receives the best passages, even for a question the documents do not cover, so a small model can write a confident wrong answer. A relevance cut-off needs tuning on real data first.
+- `eval.py` checks that search finds the right page, not that answers are right.
+- Unanswered questions reach the gap report only when the model uses the exact English "could not find" sentence; answers marked not helpful always do.
+- Any company can sign up without verifying an email address, and signup reveals whether an email already has an account.
+- Uploaded documents can contain instructions aimed at the model; they can mislead answers within that workspace.
+
+## Next
+
+Billing (needs a payment provider account), then connectors: GitHub repositories, then Slack and meeting notes.

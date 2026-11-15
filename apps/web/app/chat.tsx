@@ -14,10 +14,11 @@ export type Turn = {
   feedback?: -1 | 1 | null;
   streaming?: boolean;
 };
-type Doc = { name: string; chunks: number };
+type Doc = { id: number; name: string; chunks: number };
 
-const CITATION = /\[(\d+(?:\s*,\s*\d+)*)\]/;
-const TOKENS = /(\[\d+(?:\s*,\s*\d+)*\]|`[^`\n]+`|\*\*[^*\n]+\*\*)/;
+// [1], [1, 3] and [Source 1]; keep in step with CITED in apps/api/rag.py.
+const CITATION = /\[(?:Sources? )?(\d+(?:\s*,\s*\d+)*)\]/;
+const TOKENS = /(\[(?:Sources? )?\d+(?:\s*,\s*\d+)*\]|`[^`\n]+`|\*\*[^*\n]+\*\*)/;
 
 const citedNumbers = (answer: string) =>
   new Set([...answer.matchAll(new RegExp(CITATION, "g"))].flatMap((m) => m[1].split(",").map((n) => Number(n.trim()))));
@@ -32,7 +33,7 @@ const fromMessage = (m: Message): Turn => ({
   feedback: m.feedback,
 });
 
-export default function Chat({ workspace, nav }: { workspace: Workspace; nav: React.ReactNode }) {
+export default function Chat({ workspace, nav, isAdmin }: { workspace: Workspace; nav: React.ReactNode; isAdmin: boolean }) {
   const [docs, setDocs] = useState<Doc[] | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [question, setQuestion] = useState("");
@@ -48,7 +49,7 @@ export default function Chat({ workspace, nav }: { workspace: Workspace; nav: Re
   useEffect(() => {
     loadDocs();
     api<Message[]>(`/workspaces/${workspace.id}/messages`)
-      .then((ms) => setTurns(ms.map(fromMessage)))
+      .then((ms) => setTurns((now) => [...ms.map(fromMessage), ...now])) // keep a question asked while this loaded
       .catch(() => {});
   }, [loadDocs, workspace.id]);
   useEffect(() => {
@@ -66,7 +67,7 @@ export default function Chat({ workspace, nav }: { workspace: Workspace; nav: Re
     const history = turns
       .filter((t) => t.answer && !t.error && !t.streaming)
       .slice(-2)
-      .map((t) => ({ question: t.question, answer: t.answer }));
+      .map((t) => ({ question: t.question, answer: t.answer?.slice(0, 600) })); // the server reads no more
     const key = `q${Date.now()}`;
     setTurns((all) => [...all, { key, question: text, streaming: true }]);
     setQuestion("");
@@ -95,6 +96,17 @@ export default function Chat({ workspace, nav }: { workspace: Workspace; nav: Re
     }
   }
 
+  async function removeDoc(doc: Doc) {
+    if (!window.confirm(`Remove ${doc.name} from ${workspace.name}? Answers will no longer use it.`)) return;
+    try {
+      await api(`/workspaces/${workspace.id}/documents/${doc.id}`, { method: "DELETE" });
+      setUpload(`${doc.name} removed.`);
+    } catch (err) {
+      setUpload(err instanceof Error ? err.message : "Could not remove the document");
+    }
+    loadDocs();
+  }
+
   async function addFiles(files: FileList) {
     let stored = 0;
     const problems: string[] = [];
@@ -121,7 +133,18 @@ export default function Chat({ workspace, nav }: { workspace: Workspace; nav: Re
         <h1>{workspace.name}</h1>
         <details className="docs">
           <summary>{docs === null ? "Loading documents…" : `${docs.length} document${docs.length === 1 ? "" : "s"}`}</summary>
-          <ul>{docs?.map((d) => <li key={d.name}>{d.name}</li>)}</ul>
+          <ul>
+            {docs?.map((d) => (
+              <li key={d.id}>
+                <span>{d.name}</span>
+                {isAdmin && (
+                  <button className="link" aria-label={`Remove ${d.name}`} onClick={() => removeDoc(d)}>
+                    Remove
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
         </details>
         <button onClick={() => fileInput.current?.click()}>Add documents</button>
         <input ref={fileInput} type="file" hidden multiple accept=".md,.mdx,.txt,.pdf,.docx" onChange={(e) => e.target.files?.length && addFiles(e.target.files)} />
@@ -178,11 +201,16 @@ export function TurnView({ turn, onRate }: { turn: Turn; onRate?: (value: -1 | 1
             {turn.answer.split(TOKENS).map((part, i) => {
               const m = part.match(CITATION);
               if (m && m[0] === part)
-                return m[1].split(",").map((n) => (
-                  <button key={`${i}-${n}`} className="cite" aria-label={`Show source ${n.trim()}`} onClick={() => setActive(Number(n.trim()))}>
-                    {n.trim()}
-                  </button>
-                ));
+                return m[1].split(",").map((raw) => {
+                  const n = Number(raw.trim());
+                  // A number the model made up, with no source behind it, is not shown as a citation.
+                  if (!sources.some((s) => s.n === n)) return <span key={`${i}-${n}`} className="bad-cite">[{n}]</span>;
+                  return (
+                    <button key={`${i}-${n}`} className="cite" aria-label={`Show source ${n}`} onClick={() => setActive(n)}>
+                      {n}
+                    </button>
+                  );
+                });
               if (part.startsWith("`")) return <code key={i}>{part.slice(1, -1)}</code>;
               if (part.startsWith("**")) return <strong key={i}>{part.slice(2, -2)}</strong>;
               return part;
