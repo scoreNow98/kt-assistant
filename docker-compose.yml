@@ -1,0 +1,40 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: kt
+      POSTGRES_PASSWORD: kt  # local development only
+      POSTGRES_DB: kt
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+      - ./infra/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kt"]
+      interval: 3s
+      retries: 20
+
+  api:
+    build: apps/api
+    environment:
+      DATABASE_URL: postgresql://kt:kt@db:5432/kt
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/api:/app
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: apps/web
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./apps/web/app:/app/app
+    depends_on:
+      - api
+
+volumes:
+  dbdata:
