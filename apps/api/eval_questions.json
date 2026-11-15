@@ -117,7 +117,10 @@
   {
     "workspace": "client-a",
     "question": "db session should close after the request finishes, how?",
-    "expect": "dependencies-with-yield.md"
+    "expect": [
+      "dependencies-with-yield.md",
+      "advanced/advanced-dependencies.md"
+    ]
   },
   {
     "workspace": "client-a",
