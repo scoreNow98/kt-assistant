@@ -2,7 +2,7 @@
 
 Knowledge-transfer assistant for service teams: one workspace per client, answers with links to the source document.
 
-Status: **phase 1, core RAG for one user**. Upload documents into a workspace, ask a question, get an answer with numbered sources. No login yet.
+Status: **phase 2, accounts and client workspaces**. A company signs up, creates one workspace per client, invites people and chooses who can open which client. Answers come with numbered sources beside them.
 
 ## One-time setup
 
@@ -26,20 +26,30 @@ ollama pull gemma3:4b   # answers
 docker compose up --build
 ```
 
-Load the sample documents (in a second terminal, takes several minutes the first time):
+Open http://localhost:3000 and choose "Create a company account". The first account of a company is its admin.
+
+Load the sample documents into two workspaces of your company (in a second terminal, several minutes the first time). Use the email you signed up with:
 
 ```bash
-docker compose exec api python ingest.py client-a /sample-data/client-a
-docker compose exec api python ingest.py client-b /sample-data/client-b
+docker compose exec api python ingest.py you@example.com client-a /sample-data/client-a
+docker compose exec api python ingest.py you@example.com client-b /sample-data/client-b
 ```
 
-Open http://localhost:3000, keep the workspace as `client-a`, and ask a question such as "How do I allow requests from a frontend on a different origin?". You can also add your own `.md`, `.txt`, `.pdf` or `.docx` file on that page.
+Reload the page, open `client-a` and ask, for example, "How do I allow requests from a frontend on a different origin?".
+
+## Who can see what
+
+- An **admin** sees every workspace of the company, creates workspaces and invites people under "Team and access".
+- A **member** sees only the workspaces an admin ticked for them.
+- Another company sees nothing. This is enforced twice: in the API, and in Postgres itself with row-level security (`apps/api/schema.sql`).
+
+Invites are links the admin copies and sends; the app does not send email.
 
 ## Check
 
 ```bash
-docker compose exec api pytest          # unit tests plus a workspace-isolation test
-docker compose exec api python eval.py  # do 20 test questions find the right document?
+docker compose exec api pytest                           # includes the cross-company leak tests
+docker compose exec api python eval.py you@example.com   # do 20 test questions find the right document?
 ```
 
 ## Change the models
@@ -58,12 +68,12 @@ Documents embedded with one embedding model are not searched with another, so re
 ## Layout
 
 ```
-apps/api/     FastAPI backend (rag.py holds parse, chunk, embed, search, answer)
+apps/api/     FastAPI backend: main.py routes, auth.py logins, db.py connections, rag.py search and answers
 apps/web/     Next.js frontend
 infra/        database setup
 scripts/      helper scripts
 ```
 
-## Next: phase 2
+## Next: phase 3
 
-Login, organisations, client workspaces with members, and database-enforced isolation.
+Answer quality: keyword search next to vector search, streaming answers, chat history, feedback.

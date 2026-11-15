@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 
 import httpx
-import psycopg
 
 # Any OpenAI-compatible server works: Ollama locally now, a paid API later.
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://host.docker.internal:11434/v1")
@@ -16,16 +15,7 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gemma3:4b")
 
 SUFFIXES = {".md", ".mdx", ".txt", ".pdf", ".docx"}
 NOT_FOUND = "I could not find this in the documents."
-HEADING = re.compile(r"#{1,6}\s+(.+)")
-
-
-def connect():
-    return psycopg.connect(os.environ["DATABASE_URL"])
-
-
-def init_schema():
-    with connect() as conn:
-        conn.execute(Path(__file__).with_name("schema.sql").read_text())
+HEADING = re.compile(r"#{1,6}\s+(.+?)(?:\s*\{\s*#[^}]*\})?\s*$")  # drops a trailing {#anchor}
 
 
 def extract(name: str, data: bytes) -> list[tuple[int | None, str]]:
@@ -110,8 +100,11 @@ def _vector(v: list[float]) -> str:
     return "[" + ",".join(map(str, v)) + "]"
 
 
-def ingest(workspace: str, name: str, data: bytes) -> dict:
-    """Stores one file as chunks. The same file twice in a workspace is skipped."""
+def ingest(conn, workspace_id: int, name: str, data: bytes) -> dict:
+    """Stores one file as chunks. The same file twice in a workspace is skipped.
+
+    conn decides who is asking: pass a db.user_db() connection for a signed-in user.
+    """
     pieces = [
         (page, heading, text)
         for page, part in extract(name, data)
@@ -119,49 +112,49 @@ def ingest(workspace: str, name: str, data: bytes) -> dict:
     ]
     if not pieces:
         raise ValueError("no readable text in this file (scanned PDFs are not supported yet)")
-    with connect() as conn:  # one transaction: a failed embedding leaves nothing behind
-        row = conn.execute(
-            "INSERT INTO documents (workspace, name, sha256) VALUES (%s, %s, %s) "
-            "ON CONFLICT DO NOTHING RETURNING id",
-            (workspace, name, hashlib.sha256(data).hexdigest()),
-        ).fetchone()
-        if row is None:
-            return {"name": name, "status": "duplicate", "chunks": 0}
-        vectors = embed([f"{name} > {heading}\n{text}" for _, heading, text in pieces])
-        conn.cursor().executemany(
-            "INSERT INTO chunks (document_id, workspace, heading, page, text, embed_model, embedding) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s::vector)",
-            [
-                (row[0], workspace, heading, page, text, EMBED_MODEL, _vector(v))
-                for (page, heading, text), v in zip(pieces, vectors, strict=True)
-            ],
-        )
+    # The caller's transaction covers all of this: a failed embedding leaves nothing behind.
+    row = conn.execute(
+        "INSERT INTO documents (workspace_id, name, sha256) VALUES (%s, %s, %s) "
+        "ON CONFLICT DO NOTHING RETURNING id",
+        (workspace_id, name, hashlib.sha256(data).hexdigest()),
+    ).fetchone()
+    if row is None:
+        return {"name": name, "status": "duplicate", "chunks": 0}
+    vectors = embed([f"{name} > {heading}\n{text}" for _, heading, text in pieces])
+    conn.cursor().executemany(
+        "INSERT INTO chunks (document_id, workspace_id, heading, page, text, embed_model, embedding) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s::vector)",
+        [
+            (row[0], workspace_id, heading, page, text, EMBED_MODEL, _vector(v))
+            for (page, heading, text), v in zip(pieces, vectors, strict=True)
+        ],
+    )
     return {"name": name, "status": "ready", "chunks": len(pieces)}
 
 
-def search(workspace: str, question: str, k: int = 8) -> list[dict]:
+def search(conn, workspace_id: int, question: str, k: int = 8) -> list[dict]:
     """The k closest chunks. The workspace filter is the tenant boundary: never remove it."""
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT d.name, c.heading, c.page, c.text FROM chunks c "
-            "JOIN documents d ON d.id = c.document_id "
-            "WHERE c.workspace = %s AND c.embed_model = %s "
-            "ORDER BY c.embedding <=> %s::vector LIMIT %s",
-            (workspace, EMBED_MODEL, _vector(embed([question])[0]), k),
-        ).fetchall()
+    rows = conn.execute(
+        "SELECT d.name, c.heading, c.page, c.text FROM chunks c "
+        "JOIN documents d ON d.id = c.document_id "
+        "WHERE c.workspace_id = %s AND c.embed_model = %s "
+        "ORDER BY c.embedding <=> %s::vector LIMIT %s",
+        (workspace_id, EMBED_MODEL, _vector(embed([question])[0]), k),
+    ).fetchall()
     return [
         {"n": n, "document": name, "heading": heading, "page": page, "text": text}
         for n, (name, heading, page, text) in enumerate(rows, 1)
     ]
 
 
-def ask(workspace: str, question: str) -> dict:
-    sources = search(workspace, question)
+def ask(conn, workspace_id: int, question: str) -> dict:
+    sources = search(conn, workspace_id, question)
     if not sources:
         return {"answer": NOT_FOUND, "sources": []}
     system = (
         "You answer questions for a software team using only the numbered sources below. "
-        "Cite every claim with its source number, like [1]. "
+        "Put the source number right after each sentence it supports, like this [1]. "
+        "Never list source numbers at the start of the answer. "
         f"If the sources do not contain the answer, reply exactly: {NOT_FOUND}"
     )
     context = "\n\n".join(f"[{s['n']}] {s['document']} > {s['heading']}\n{s['text']}" for s in sources)
