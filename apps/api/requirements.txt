@@ -1,5 +1,8 @@
 fastapi
 uvicorn[standard]
 psycopg[binary]
-pytest
 httpx
+python-multipart
+pypdf
+python-docx
+pytest

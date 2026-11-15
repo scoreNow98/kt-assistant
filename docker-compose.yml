@@ -17,10 +17,17 @@ services:
     build: apps/api
     environment:
       DATABASE_URL: postgresql://kt:kt@db:5432/kt
+      # Any OpenAI-compatible server. Default: Ollama running on your Mac.
+      # To change, put the same names in a .env file next to this one.
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      EMBED_MODEL: ${EMBED_MODEL:-bge-m3}
+      CHAT_MODEL: ${CHAT_MODEL:-gemma3:4b}
     ports:
       - "8000:8000"
     volumes:
       - ./apps/api:/app
+      - ./sample-data:/sample-data:ro
     depends_on:
       db:
         condition: service_healthy

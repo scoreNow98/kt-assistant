@@ -1,4 +1,6 @@
-// Health page: rendered on the server, so the browser never calls the API directly.
+import Chat from "./chat";
+
+// The health line is rendered on the server; the chat calls the API from the browser.
 export const dynamic = "force-dynamic";
 
 type Health = { api: string; db: string; pgvector: string | null };
@@ -17,11 +19,10 @@ export default async function Home() {
   return (
     <main>
       <h1>KT Assistant</h1>
-      <ul>
-        <li>API: {h.api}</li>
-        <li>Database: {h.db}</li>
-        <li>pgvector: {h.pgvector ?? "not installed"}</li>
-      </ul>
+      <p>
+        API: {h.api} · Database: {h.db} · pgvector: {h.pgvector ?? "not installed"}
+      </p>
+      <Chat />
     </main>
   );
 }
