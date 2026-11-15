@@ -208,3 +208,86 @@ def test_model_down_before_answer_is_a_502(world, monkeypatch):
     monkeypatch.setattr(rag, "embed", down)
     status, body = ask(world["admin"], world["bank"], "anything")
     assert status == 502 and "Ollama" in body["detail"]
+
+
+def test_gap_report_lists_unanswered_and_unhelpful_questions_without_names(world, monkeypatch):
+    admin, member, rival, bank, tag = world["admin"], world["member"], world["rival"], world["bank"], world["tag"]
+    member_id = next(m["id"] for m in admin.get("/team").json() if m["role"] == "member")
+    admin.put(f"/workspaces/{bank}/members/{member_id}")
+
+    monkeypatch.setattr(rag, "chat_stream", lambda s, u: iter([rag.NOT_FOUND]))
+    ask(admin, bank, "Who owns the billing database?")
+    ask(member, bank, "who owns the billing database?")  # same question, other person, other case
+    monkeypatch.setattr(rag, "chat_stream", lambda s, u: iter(["Use make restart [1]"]))
+    _, lines = ask(member, bank, "how do I restart the service?")
+    member.put(f"/messages/{lines[-1]['message_id']}/feedback", json={"value": -1})
+    ask(admin, bank, "a question that was answered fine")
+
+    gaps = member.get(f"/workspaces/{bank}/gaps").json()
+    assert [(g["question"].lower(), g["asked"], g["not_found"], g["not_helpful"]) for g in gaps] == [
+        ("who owns the billing database?", 2, True, False),
+        ("how do i restart the service?", 1, False, True),
+    ]
+    assert tag not in json.dumps(gaps)  # no email addresses
+    assert rival.get(f"/workspaces/{bank}/gaps").status_code == 404
+
+
+def test_guide_is_built_by_admins_and_read_by_members(world):
+    admin, member, rival, bank = world["admin"], world["member"], world["rival"], world["bank"]
+    member_id = next(m["id"] for m in admin.get("/team").json() if m["role"] == "member")
+    admin.put(f"/workspaces/{bank}/members/{member_id}")
+
+    assert admin.get(f"/workspaces/{bank}/guide").json() is None
+    assert member.post(f"/workspaces/{bank}/guide").status_code == 403
+    assert rival.post(f"/workspaces/{bank}/guide").status_code == 404  # an admin, but of another company
+    assert rival.get(f"/workspaces/{bank}/guide").status_code == 404
+
+    r = admin.post(f"/workspaces/{bank}/guide")
+    lines = [json.loads(line) for line in r.text.splitlines()]
+    assert [line["section"]["title"] for line in lines[:-1]] == [t for t, _ in main.GUIDE_SECTIONS]
+    assert lines[-1] == {"done": True, "reading_order": ["runbook.md"]}
+
+    saved = member.get(f"/workspaces/{bank}/guide").json()
+    assert saved["reading_order"] == ["runbook.md"] and saved["sections"][0]["answer"] == "Use make restart [1]"
+    admin.post(f"/workspaces/{bank}/guide")  # building again replaces it
+    assert len(member.get(f"/workspaces/{bank}/guide").json()["sections"]) == len(main.GUIDE_SECTIONS)
+
+
+def test_guide_is_not_saved_when_the_model_fails(world, monkeypatch):
+    def broken(system, user):
+        raise httpx.ReadTimeout("model stopped")
+        yield
+
+    monkeypatch.setattr(rag, "chat_stream", broken)
+    lines = [json.loads(line) for line in world["admin"].post(f"/workspaces/{world['bank']}/guide").text.splitlines()]
+    assert "Ollama" in lines[-1]["error"]
+    assert world["admin"].get(f"/workspaces/{world['bank']}/guide").json() is None
+
+
+def test_handover_notes_become_a_searchable_document(world):
+    admin, rival, bank, tag = world["admin"], world["rival"], world["bank"], world["tag"]
+    answers = [
+        {"question": "Who owns the billing database?", "answer": "Priya on the client side; escalate to the DBA rota."},
+        {"question": "What breaks most often?", "answer": "   "},  # empty answers are left out
+    ]
+    r = admin.post(f"/workspaces/{bank}/handover", json={"answers": answers})
+    assert r.status_code == 200 and r.json()["status"] == "ready"
+    name = r.json()["name"]
+    assert name.startswith(f"handover/lead-{tag}-") and "@" not in name
+
+    assert name in [d["name"] for d in admin.get(f"/workspaces/{bank}/documents").json()]
+    with admin_db() as conn:
+        hits = rag.search(conn, bank, "who owns the billing database", k=1)
+    assert hits[0]["document"] == name and hits[0]["heading"] == "Who owns the billing database?"
+    assert "breaks" not in hits[0]["text"]
+
+    assert admin.post(f"/workspaces/{bank}/handover", json={"answers": answers[1:]}).status_code == 400
+    assert rival.post(f"/workspaces/{bank}/handover", json={"answers": answers}).status_code == 404
+
+
+def test_guides_are_hidden_by_the_database_too(world):
+    world["admin"].post(f"/workspaces/{world['bank']}/guide")
+    with admin_db() as conn:
+        rival_id = conn.execute("SELECT id FROM users WHERE email = %s", (f"boss-{world['tag']}@rival.test",)).fetchone()[0]
+    with user_db(rival_id) as conn:
+        assert conn.execute("SELECT count(*) FROM guides").fetchone()[0] == 0

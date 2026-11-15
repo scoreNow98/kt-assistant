@@ -687,3 +687,167 @@ td {
   border-color: var(--ink);
   font-weight: 600;
 }
+
+/* ---------- phase 4: workspace tabs, guide, gaps, handover ---------- */
+
+.tabs {
+  flex-basis: 100%;
+  display: flex;
+  gap: 1.5rem;
+  margin-bottom: -1.1rem;
+}
+
+.tabs button {
+  border: 0;
+  border-radius: 0;
+  padding: 0.6rem 0 0.55rem;
+  color: var(--muted);
+  border-bottom: 3px solid transparent;
+}
+
+.tabs button:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+.tabs button[aria-current] {
+  color: var(--ink);
+  font-weight: 600;
+  border-bottom-color: var(--mark);
+}
+
+.panel {
+  height: 100vh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.panel header {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 1rem;
+  padding: 1.1rem 2.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel h1 {
+  font: 400 1.5rem var(--serif);
+}
+
+.panel-body {
+  overflow-y: auto;
+  padding: 0 2.5rem 3rem;
+}
+
+.kt-intro {
+  max-width: 38rem;
+  padding: 2rem 0 1rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.kt-intro h2 {
+  font: 400 1.75rem/1.2 var(--serif);
+}
+
+.kt-intro p,
+.quiet {
+  color: var(--muted);
+}
+
+.reading {
+  max-width: 38rem;
+  padding: 1rem 0 0.5rem;
+}
+
+.reading h3 {
+  font-size: 1rem;
+  margin: 0 0 0.5rem;
+}
+
+.reading ol {
+  list-style: decimal;
+  padding-left: 1.5rem;
+  font: 1.0625rem/1.7 var(--serif);
+}
+
+.gaps {
+  max-width: 44rem;
+}
+
+.gaps li {
+  padding: 0.9rem 0 0.9rem 0.9rem;
+  border-left: 3px solid var(--mark);
+  margin-bottom: 0.75rem;
+  background: var(--paper);
+}
+
+.gaps .q {
+  font: 1.125rem/1.4 var(--serif);
+}
+
+.gaps .meta {
+  color: var(--muted);
+  font-size: 0.8125rem;
+  margin-top: 0.25rem;
+}
+
+.kt-next {
+  margin-top: 1.5rem;
+}
+
+.handover {
+  max-width: 42rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  padding-bottom: 3rem;
+}
+
+.handover label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.handover label span {
+  font: 1.0625rem/1.4 var(--serif);
+}
+
+.handover label.gap span {
+  border-left: 3px solid var(--mark);
+  padding-left: 0.6rem;
+}
+
+.handover small {
+  color: var(--muted);
+}
+
+.handover textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  resize: vertical;
+}
+
+.handover > button {
+  align-self: flex-start;
+  padding: 0.6rem 1.2rem;
+}
+
+@media (max-width: 44rem) {
+  .panel {
+    height: auto;
+    min-height: 100vh;
+  }
+  .panel header,
+  .panel-body {
+    padding-left: 1.25rem;
+    padding-right: 1.25rem;
+  }
+}

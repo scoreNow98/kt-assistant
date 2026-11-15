@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, stream, type Message, type Source, type Workspace } from "./api";
 
-type Turn = {
+export type Turn = {
   key: string;
   question: string;
   searchedFor?: string;
@@ -32,7 +32,7 @@ const fromMessage = (m: Message): Turn => ({
   feedback: m.feedback,
 });
 
-export default function Chat({ workspace }: { workspace: Workspace }) {
+export default function Chat({ workspace, nav }: { workspace: Workspace; nav: React.ReactNode }) {
   const [docs, setDocs] = useState<Doc[] | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [question, setQuestion] = useState("");
@@ -125,6 +125,7 @@ export default function Chat({ workspace }: { workspace: Workspace }) {
         </details>
         <button onClick={() => fileInput.current?.click()}>Add documents</button>
         <input ref={fileInput} type="file" hidden multiple accept=".md,.mdx,.txt,.pdf,.docx" onChange={(e) => e.target.files?.length && addFiles(e.target.files)} />
+        {nav}
         <p className="upload-status" role="status">{upload}</p>
       </header>
 
@@ -159,7 +160,7 @@ export default function Chat({ workspace }: { workspace: Workspace }) {
   );
 }
 
-function TurnView({ turn, onRate }: { turn: Turn; onRate: (value: -1 | 1) => void }) {
+export function TurnView({ turn, onRate }: { turn: Turn; onRate?: (value: -1 | 1) => void }) {
   const [active, setActive] = useState<number | null>(null);
   const cited = citedNumbers(turn.answer ?? "");
   const sources = turn.sources ?? [];
@@ -192,7 +193,7 @@ function TurnView({ turn, onRate }: { turn: Turn; onRate: (value: -1 | 1) => voi
           <p className="pending" role="status">{turn.sources ? "Writing the answer…" : "Reading the documents…"}</p>
         )}
         {turn.error && <p className="error" role="alert">{turn.error}</p>}
-        {turn.messageId !== undefined && (
+        {turn.messageId !== undefined && onRate && (
           <div className="rate" role="group" aria-label="Was this answer helpful?">
             <button aria-pressed={turn.feedback === 1} onClick={() => onRate(1)}>Helpful</button>
             <button aria-pressed={turn.feedback === -1} onClick={() => onRate(-1)}>Not helpful</button>

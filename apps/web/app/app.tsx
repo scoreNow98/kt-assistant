@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, post, type Health, type Me } from "./api";
-import Chat from "./chat";
 import Team from "./team";
+import WorkspaceView from "./workspace";
 
 export default function App({ health }: { health: Health }) {
   const [me, setMe] = useState<Me | null | undefined>(undefined); // undefined = still loading
@@ -84,7 +84,7 @@ export default function App({ health }: { health: Health }) {
         {view === "team" && me.role === "admin" ? (
           <Team workspaces={me.workspaces} />
         ) : workspace ? (
-          <Chat key={workspace.id} workspace={workspace} />
+          <WorkspaceView key={workspace.id} workspace={workspace} isAdmin={me.role === "admin"} />
         ) : (
           <div className="empty">
             <h1>No workspaces yet</h1>

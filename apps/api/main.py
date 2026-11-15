@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
@@ -336,6 +337,114 @@ def feedback(message_id: int, body: Feedback, user: User):
     if not updated:
         raise HTTPException(404, "Message not found")
     return {"ok": True}
+
+
+# ---------- knowledge transfer ----------
+
+GAP_DAYS = 30
+# The answer prompt asks for this sentence when the documents lack the answer; small models sometimes add to it.
+NOT_FOUND_PATTERN = "%could not find this in the documents%"
+
+GUIDE_SECTIONS = [
+    ("What this is", "What is this project or system, and what does it do?"),
+    ("Main parts", "What are the main parts or components, and how do they fit together?"),
+    ("Set up and run it", "How do I install, set up and run it?"),
+    ("Common problems", "What are common problems or errors, and how are they fixed?"),
+    ("Key terms", "What are the most important terms a newcomer should know? Explain each in one sentence."),
+]
+
+
+@app.get("/workspaces/{workspace_id}/gaps")
+def gaps(workspace_id: int, user: User):
+    """Questions from the last 30 days that the documents could not answer or that someone marked
+    not helpful. Shared with everyone who can open the workspace, without saying who asked."""
+    with user_db(user["id"]) as conn:
+        open_workspace(conn, workspace_id)
+    with admin_db() as conn:  # reads every member's questions; access was checked just above
+        rows = conn.execute(
+            "SELECT min(searched_for), count(*), max(created_at), "
+            "coalesce(bool_or(answer ILIKE %(nf)s), false), coalesce(bool_or(feedback = -1), false) "
+            "FROM messages WHERE workspace_id = %(w)s AND created_at > now() - make_interval(days => %(days)s) "
+            "AND (answer ILIKE %(nf)s OR feedback = -1) "
+            "GROUP BY lower(searched_for) ORDER BY count(*) DESC, max(created_at) DESC LIMIT 50",
+            {"nf": NOT_FOUND_PATTERN, "w": workspace_id, "days": GAP_DAYS},
+        ).fetchall()
+    return [
+        {"question": q, "asked": n, "last_asked": last.isoformat(), "not_found": nf, "not_helpful": nh}
+        for q, n, last, nf, nh in rows
+    ]
+
+
+@app.get("/workspaces/{workspace_id}/guide")
+def guide(workspace_id: int, user: User):
+    with user_db(user["id"]) as conn:
+        open_workspace(conn, workspace_id)
+        row = conn.execute(
+            "SELECT sections, reading_order, created_at FROM guides WHERE workspace_id = %s", (workspace_id,)
+        ).fetchone()
+    return {"sections": row[0], "reading_order": row[1], "created_at": row[2].isoformat()} if row else None
+
+
+@app.post("/workspaces/{workspace_id}/guide")
+def create_guide(workspace_id: int, user: Admin):
+    """Streams one {section} line per finished section, then {done}. Saves only a complete guide."""
+    with user_db(user["id"]) as conn:
+        open_workspace(conn, workspace_id)
+
+    def lines():
+        sections = []
+        try:
+            for title, question in GUIDE_SECTIONS:
+                with user_db(user["id"]) as conn:
+                    sources = rag.search(conn, workspace_id, question)
+                section = {"title": title, "answer": "".join(rag.answer_stream(sources, question)), "sources": sources}
+                sections.append(section)
+                yield json.dumps({"section": section}) + "\n"
+        except httpx.HTTPError as e:
+            log.error("model server call failed: %r", e)
+            yield json.dumps({"error": model_down_message()}) + "\n"
+            return
+        # Reading order: documents in the order the guide first cites them.
+        reading_order = []
+        for section in sections:
+            cited = {int(n) for group in rag.CITED.findall(section["answer"]) for n in group.split(",")}
+            for s in section["sources"]:
+                if s["n"] in cited and s["document"] not in reading_order:
+                    reading_order.append(s["document"])
+        with user_db(user["id"]) as conn:
+            conn.execute(
+                "INSERT INTO guides (workspace_id, sections, reading_order) VALUES (%s, %s, %s) "
+                "ON CONFLICT (workspace_id) DO UPDATE SET sections = excluded.sections, "
+                "reading_order = excluded.reading_order, created_at = now()",
+                (workspace_id, Jsonb(sections), Jsonb(reading_order)),
+            )
+        yield json.dumps({"done": True, "reading_order": reading_order}) + "\n"
+
+    return StreamingResponse(lines(), media_type="application/x-ndjson")
+
+
+class HandoverAnswer(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    answer: str = Field(max_length=10_000)
+
+
+class Handover(BaseModel):
+    answers: list[HandoverAnswer] = Field(min_length=1, max_length=30)
+
+
+@app.post("/workspaces/{workspace_id}/handover")
+def handover(workspace_id: int, body: Handover, user: User):
+    """Saves a leaving person's answers as a document, one section per question, so they can be cited."""
+    filled = [a for a in body.answers if a.answer.strip()]
+    if not filled:
+        raise HTTPException(400, "Write at least one answer before saving")
+    now = datetime.now(timezone.utc)
+    text = f"# Handover notes from {user['email']}, {now:%d %b %Y}\n\n" + "\n\n".join(
+        f"## {' '.join(a.question.split())}\n\n{a.answer.strip()}" for a in filled
+    )
+    with user_db(user["id"]) as conn:
+        open_workspace(conn, workspace_id)
+        return rag.ingest(conn, workspace_id, f"handover/{user['email'].split('@')[0]}-{now:%Y-%m-%d-%H%M}.md", text.encode())
 
 
 @app.get("/health")

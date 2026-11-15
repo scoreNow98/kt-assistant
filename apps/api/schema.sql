@@ -97,6 +97,14 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_workspace_user ON messages (workspace_id, user_id, id);
 
+-- The saved "Start here" guide, one per workspace.
+CREATE TABLE IF NOT EXISTS guides (
+  workspace_id bigint PRIMARY KEY REFERENCES workspaces (id) ON DELETE CASCADE,
+  sections jsonb NOT NULL,
+  reading_order jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- Row-level security: client data is read and written as the role kt_app, which only sees
 -- workspaces the current user (app.user_id) may open. The API code filters too; this is the second lock.
 DO $$ BEGIN
@@ -105,7 +113,7 @@ DO $$ BEGIN
   END IF;
 END $$;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON workspaces, workspace_members, documents, chunks, messages TO kt_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON workspaces, workspace_members, documents, chunks, messages, guides TO kt_app;
 GRANT SELECT (id, email, org_id, role) ON users TO kt_app;  -- never the password hash
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO kt_app;
 
@@ -113,6 +121,7 @@ ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE guides ENABLE ROW LEVEL SECURITY;
 
 -- Same organisation, and either an admin or a member of that workspace.
 DROP POLICY IF EXISTS workspace_access ON workspaces;
@@ -137,3 +146,6 @@ DROP POLICY IF EXISTS message_access ON messages;
 CREATE POLICY message_access ON messages USING (
   user_id = current_setting('app.user_id', true)::bigint AND workspace_id IN (SELECT id FROM workspaces)
 );
+
+DROP POLICY IF EXISTS guide_access ON guides;
+CREATE POLICY guide_access ON guides USING (workspace_id IN (SELECT id FROM workspaces));

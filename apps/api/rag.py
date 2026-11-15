@@ -17,6 +17,7 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gemma3:4b")
 
 SUFFIXES = {".md", ".mdx", ".txt", ".pdf", ".docx"}
 NOT_FOUND = "I could not find this in the documents."
+CITED = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")  # [1] or [1, 3]
 HEADING = re.compile(r"#{1,6}\s+(.+?)(?:\s*\{\s*#[^}]*\})?\s*$")  # drops a trailing {#anchor}
 
 

@@ -2,7 +2,12 @@
 
 Knowledge-transfer assistant for service teams: one workspace per client, answers with links to the source document.
 
-Status: **phase 3, answer quality**. Search combines meaning (vectors) with exact words (keywords), follow-up questions are understood, answers stream in as they are written, and each person's questions are saved with a helpful / not helpful rating. Phase 2 accounts and per-client access are unchanged.
+Status: **phase 4, knowledge transfer**. Each client workspace has four tabs:
+
+- **Ask:** questions answered from the documents, with sources beside each answer (phase 3).
+- **Start here:** an onboarding guide an admin creates in one click: five cited sections and a reading order.
+- **Gaps:** questions from the last 30 days the documents could not answer, or whose answers were marked not helpful. Who asked is not shown.
+- **Hand over:** someone leaving answers those gaps and a few standard questions; the answers are saved as a document that later answers cite.
 
 ## One-time setup
 
@@ -76,6 +81,6 @@ scripts/      helper scripts
 
 `eval.py` prints two scores: vector search alone, and the hybrid search the app uses. The last 10 questions are harder on purpose: exact setting names and loosely worded questions.
 
-## Next: phase 4
+## Next: phase 5
 
-Knowledge-transfer features: a gap report of questions the documents could not answer, an onboarding path per client, and exit capture.
+Make it sellable: usage limits per company, billing, a landing page, cloud deployment, error alerts and backups.
