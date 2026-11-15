@@ -77,6 +77,26 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 CREATE INDEX IF NOT EXISTS chunks_workspace_id ON chunks (workspace_id);
 
+-- Keyword search, for exact terms such as error codes and setting names. Filled in for existing rows too.
+-- shortcut: English word stemming only; add a 'simple' column next to it when Hindi documents arrive.
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', heading || ' ' || text)) STORED;
+CREATE INDEX IF NOT EXISTS chunks_tsv ON chunks USING gin (tsv);
+
+-- Every question asked, with its answer and sources: chat history, feedback, and later the gap report.
+CREATE TABLE IF NOT EXISTS messages (
+  id bigserial PRIMARY KEY,
+  workspace_id bigint NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE,
+  user_id bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  question text NOT NULL,
+  searched_for text NOT NULL,
+  answer text NOT NULL,
+  sources jsonb NOT NULL,
+  feedback smallint CHECK (feedback IN (-1, 1)),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS messages_workspace_user ON messages (workspace_id, user_id, id);
+
 -- Row-level security: client data is read and written as the role kt_app, which only sees
 -- workspaces the current user (app.user_id) may open. The API code filters too; this is the second lock.
 DO $$ BEGIN
@@ -85,13 +105,14 @@ DO $$ BEGIN
   END IF;
 END $$;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON workspaces, workspace_members, documents, chunks TO kt_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON workspaces, workspace_members, documents, chunks, messages TO kt_app;
 GRANT SELECT (id, email, org_id, role) ON users TO kt_app;  -- never the password hash
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO kt_app;
 
 ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 
 -- Same organisation, and either an admin or a member of that workspace.
 DROP POLICY IF EXISTS workspace_access ON workspaces;
@@ -110,3 +131,9 @@ CREATE POLICY document_access ON documents USING (workspace_id IN (SELECT id FRO
 
 DROP POLICY IF EXISTS chunk_access ON chunks;
 CREATE POLICY chunk_access ON chunks USING (workspace_id IN (SELECT id FROM workspaces));
+
+-- People see only their own questions, and only in workspaces they can still open.
+DROP POLICY IF EXISTS message_access ON messages;
+CREATE POLICY message_access ON messages USING (
+  user_id = current_setting('app.user_id', true)::bigint AND workspace_id IN (SELECT id FROM workspaces)
+);

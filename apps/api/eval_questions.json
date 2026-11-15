@@ -1,22 +1,152 @@
 [
-  {"workspace": "client-a", "question": "How do I allow requests from a frontend on a different origin?", "expect": "tutorial/cors.md"},
-  {"workspace": "client-a", "question": "How do I run a task after returning the response?", "expect": "tutorial/background-tasks.md"},
-  {"workspace": "client-a", "question": "How do I accept an uploaded file in an endpoint?", "expect": "tutorial/request-files.md"},
-  {"workspace": "client-a", "question": "How do I write tests for my API endpoints?", "expect": "tutorial/testing.md"},
-  {"workspace": "client-a", "question": "How do I read a value from a request header?", "expect": "tutorial/header-params.md"},
-  {"workspace": "client-a", "question": "How do I return a 404 error to the client?", "expect": "tutorial/handling-errors.md"},
-  {"workspace": "client-a", "question": "How do I split the application into several files with routers?", "expect": "tutorial/bigger-applications.md"},
-  {"workspace": "client-a", "question": "How do I protect endpoints with JWT tokens?", "expect": "tutorial/security/oauth2-jwt.md"},
-  {"workspace": "client-a", "question": "How do I serve static files such as images?", "expect": "tutorial/static-files.md"},
-  {"workspace": "client-a", "question": "When should I use async def instead of def?", "expect": "async.md"},
-  {"workspace": "client-b", "question": "Which GPUs are supported?", "expect": "gpu.mdx"},
-  {"workspace": "client-b", "question": "How do I run it in Docker?", "expect": "docker.mdx"},
-  {"workspace": "client-b", "question": "How do I increase the context window size?", "expect": "context-length.mdx"},
-  {"workspace": "client-b", "question": "How do I create a custom model with its own system prompt?", "expect": "modelfile.mdx"},
-  {"workspace": "client-b", "question": "How do I use the OpenAI Python library with the local server?", "expect": "api/openai-compatibility.mdx"},
-  {"workspace": "client-b", "question": "How do I generate embeddings?", "expect": "capabilities/embeddings.mdx"},
-  {"workspace": "client-b", "question": "How do I get JSON output that follows a schema?", "expect": "capabilities/structured-outputs.mdx"},
-  {"workspace": "client-b", "question": "Where are the server logs?", "expect": "troubleshooting.mdx"},
-  {"workspace": "client-b", "question": "How do I import a GGUF model file?", "expect": "import.mdx"},
-  {"workspace": "client-b", "question": "How do I let the model call functions?", "expect": "capabilities/tool-calling.mdx"}
+  {
+    "workspace": "client-a",
+    "question": "How do I allow requests from a frontend on a different origin?",
+    "expect": "tutorial/cors.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I run a task after returning the response?",
+    "expect": "tutorial/background-tasks.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I accept an uploaded file in an endpoint?",
+    "expect": "tutorial/request-files.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I write tests for my API endpoints?",
+    "expect": "tutorial/testing.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I read a value from a request header?",
+    "expect": "tutorial/header-params.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I return a 404 error to the client?",
+    "expect": "tutorial/handling-errors.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I split the application into several files with routers?",
+    "expect": "tutorial/bigger-applications.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I protect endpoints with JWT tokens?",
+    "expect": "tutorial/security/oauth2-jwt.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I serve static files such as images?",
+    "expect": "tutorial/static-files.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "When should I use async def instead of def?",
+    "expect": "async.md"
+  },
+  {
+    "workspace": "client-b",
+    "question": "Which GPUs are supported?",
+    "expect": "gpu.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "How do I run it in Docker?",
+    "expect": "docker.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "How do I increase the context window size?",
+    "expect": "context-length.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "How do I create a custom model with its own system prompt?",
+    "expect": "modelfile.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "How do I use the OpenAI Python library with the local server?",
+    "expect": "api/openai-compatibility.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "How do I generate embeddings?",
+    "expect": "capabilities/embeddings.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "How do I get JSON output that follows a schema?",
+    "expect": "capabilities/structured-outputs.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "Where are the server logs?",
+    "expect": "troubleshooting.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "How do I import a GGUF model file?",
+    "expect": "import.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "How do I let the model call functions?",
+    "expect": "capabilities/tool-calling.mdx"
+  },
+  {
+    "workspace": "client-a",
+    "question": "Can I use allow_credentials together with allow_origins set to a wildcard?",
+    "expect": "tutorial/cors.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "Difference between response_model and the return type annotation?",
+    "expect": "tutorial/response-model.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "How do I add custom headers to an HTTPException?",
+    "expect": "tutorial/handling-errors.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "db session should close after the request finishes, how?",
+    "expect": "dependencies-with-yield.md"
+  },
+  {
+    "workspace": "client-a",
+    "question": "restrict what a token can do with scopes",
+    "expect": "oauth2-scopes.md"
+  },
+  {
+    "workspace": "client-b",
+    "question": "What does OLLAMA_KEEP_ALIVE do?",
+    "expect": "faq.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "where do the downloaded models live on disk",
+    "expect": "faq.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "how many requests can it serve at the same time?",
+    "expect": "faq.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "my browser extension gets blocked by the server, how do I allow it?",
+    "expect": "faq.mdx"
+  },
+  {
+    "workspace": "client-b",
+    "question": "company network needs a proxy for downloads",
+    "expect": "faq.mdx"
+  }
 ]

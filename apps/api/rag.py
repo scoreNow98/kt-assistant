@@ -1,8 +1,10 @@
 """Parse, chunk, embed, search and answer. No web code in this file."""
 import hashlib
 import io
+import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -68,13 +70,12 @@ def chunk(text: str, max_chars: int = 1500) -> list[tuple[str, str]]:
     return out
 
 
+def _headers() -> dict:
+    return {"Authorization": f"Bearer {LLM_API_KEY}"}
+
+
 def _post(path: str, body: dict) -> dict:
-    r = httpx.post(
-        f"{LLM_BASE_URL}{path}",
-        json=body,
-        headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-        timeout=300,
-    )
+    r = httpx.post(f"{LLM_BASE_URL}{path}", json=body, headers=_headers(), timeout=300)
     r.raise_for_status()
     return r.json()
 
@@ -87,13 +88,29 @@ def embed(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
-def chat(system: str, user: str) -> str:
-    body = {
+def _messages(system: str, user: str) -> dict:
+    return {
         "model": CHAT_MODEL,
         "temperature": 0,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
     }
-    return _post("/chat/completions", body)["choices"][0]["message"]["content"].strip()
+
+
+def chat(system: str, user: str) -> str:
+    return _post("/chat/completions", _messages(system, user))["choices"][0]["message"]["content"].strip()
+
+
+def chat_stream(system: str, user: str):
+    """Yields the answer in pieces as the model writes it."""
+    body = _messages(system, user) | {"stream": True}
+    with httpx.stream("POST", f"{LLM_BASE_URL}/chat/completions", json=body, headers=_headers(), timeout=300) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            for choice in json.loads(line[6:]).get("choices") or []:
+                if piece := (choice.get("delta") or {}).get("content"):
+                    yield piece
 
 
 def _vector(v: list[float]) -> str:
@@ -132,14 +149,44 @@ def ingest(conn, workspace_id: int, name: str, data: bytes) -> dict:
     return {"name": name, "status": "ready", "chunks": len(pieces)}
 
 
-def search(conn, workspace_id: int, question: str, k: int = 8) -> list[dict]:
-    """The k closest chunks. The workspace filter is the tenant boundary: never remove it."""
+def _keywords(question: str) -> str:
+    """Any word may match. Only letters, digits, _ and accent or vowel marks reach to_tsquery, so its
+    syntax cannot break. Marks are kept because Python's \\w would split Hindi words at their vowel signs."""
+    kept = "".join(c if c.isalnum() or c == "_" or unicodedata.category(c).startswith("M") else " " for c in question)
+    return " | ".join(kept.split()[:50])
+
+
+def search(conn, workspace_id: int, question: str, k: int = 8, keyword: bool = True) -> list[dict]:
+    """The k best chunks: vector and keyword results merged by reciprocal rank fusion.
+
+    The workspace filter is the tenant boundary: never remove it.
+    """
     rows = conn.execute(
-        "SELECT d.name, c.heading, c.page, c.text FROM chunks c "
-        "JOIN documents d ON d.id = c.document_id "
-        "WHERE c.workspace_id = %s AND c.embed_model = %s "
-        "ORDER BY c.embedding <=> %s::vector LIMIT %s",
-        (workspace_id, EMBED_MODEL, _vector(embed([question])[0]), k),
+        """
+        WITH vec AS (
+          SELECT id, row_number() OVER (ORDER BY embedding <=> %(v)s::vector) AS r FROM chunks
+          WHERE workspace_id = %(w)s AND embed_model = %(m)s
+          ORDER BY embedding <=> %(v)s::vector LIMIT 30
+        ), kw AS (
+          SELECT id, row_number() OVER (ORDER BY ts_rank_cd(tsv, q) DESC) AS r
+          FROM chunks, to_tsquery('english', %(q)s) q
+          WHERE %(use_kw)s AND workspace_id = %(w)s AND embed_model = %(m)s AND tsv @@ q
+          ORDER BY ts_rank_cd(tsv, q) DESC LIMIT 30
+        ), fused AS (
+          SELECT id, sum(1.0 / (60 + r)) AS score FROM (SELECT * FROM vec UNION ALL SELECT * FROM kw) hits GROUP BY id
+        )
+        SELECT d.name, c.heading, c.page, c.text FROM fused f
+        JOIN chunks c ON c.id = f.id JOIN documents d ON d.id = c.document_id
+        ORDER BY f.score DESC, c.id LIMIT %(k)s
+        """,
+        {
+            "v": _vector(embed([question])[0]),
+            "w": workspace_id,
+            "m": EMBED_MODEL,
+            "q": _keywords(question),
+            "use_kw": keyword,
+            "k": k,
+        },
     ).fetchall()
     return [
         {"n": n, "document": name, "heading": heading, "page": page, "text": text}
@@ -147,10 +194,25 @@ def search(conn, workspace_id: int, question: str, k: int = 8) -> list[dict]:
     ]
 
 
-def ask(conn, workspace_id: int, question: str) -> dict:
-    sources = search(conn, workspace_id, question)
+def rewrite(question: str, history: list[dict]) -> str:
+    """Turns a follow-up ("and how do I restart it?") into a question that stands on its own."""
+    if not history:
+        return question
+    convo = "\n\n".join(f"Q: {h['question']}\nA: {h['answer'][:600]}" for h in history[-2:])
+    out = chat(
+        "You rewrite the user's last question so it can be understood without the conversation. "
+        "Keep every name and technical term. If it already stands on its own, return it unchanged. "
+        "Reply with the question only.",
+        f"{convo}\n\nLast question: {question}",
+    ).strip().strip('"')
+    return out if 0 < len(out) <= 500 else question
+
+
+def answer_stream(sources: list[dict], question: str):
+    """Yields the answer in pieces. With no sources, says so without calling the model."""
     if not sources:
-        return {"answer": NOT_FOUND, "sources": []}
+        yield NOT_FOUND
+        return
     system = (
         "You answer questions for a software team using only the numbered sources below. "
         "Put the source number right after each sentence it supports, like this [1]. "
@@ -158,4 +220,4 @@ def ask(conn, workspace_id: int, question: str) -> dict:
         f"If the sources do not contain the answer, reply exactly: {NOT_FOUND}"
     )
     context = "\n\n".join(f"[{s['n']}] {s['document']} > {s['heading']}\n{s['text']}" for s in sources)
-    return {"answer": chat(system, f"{context}\n\nQuestion: {question}"), "sources": sources}
+    yield from chat_stream(system, f"{context}\n\nQuestion: {question}")

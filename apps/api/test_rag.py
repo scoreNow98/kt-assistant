@@ -22,3 +22,37 @@ def test_unsupported_file_type_is_rejected():
 
     with pytest.raises(ValueError):
         rag.extract("photo.png", b"x")
+
+
+def test_chat_stream_reads_server_sent_events(monkeypatch):
+    from contextlib import contextmanager
+
+    events = [
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+        "",
+        'data: {"choices":[{"delta":{"content":"Use make "}}]}',
+        ": keep-alive comment",
+        'data: {"choices":[{"delta":{"content":"restart [1]"}}]}',
+        'data: {"choices":[]}',
+        "data: [DONE]",
+    ]
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            return iter(events)
+
+    @contextmanager
+    def fake_stream(method, url, **kwargs):
+        assert kwargs["json"]["stream"] is True
+        yield Response()
+
+    monkeypatch.setattr(rag.httpx, "stream", fake_stream)
+    assert "".join(rag.chat_stream("system", "user")) == "Use make restart [1]"
+
+
+def test_keywords_keep_only_word_characters():
+    assert rag._keywords("Why does E1234 & allow_origins :* fail?") == "Why | does | E1234 | allow_origins | fail"
+    assert rag._keywords("कैसे चलाएं?") == "कैसे | चलाएं"

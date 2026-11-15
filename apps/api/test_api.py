@@ -1,6 +1,9 @@
 """End-to-end tests through the HTTP API. Need Postgres with pgvector; the models are faked."""
+import json
 import os
 import uuid
+
+import httpx
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,7 +31,8 @@ def fake_embed(texts):
 def world(monkeypatch):
     """Two companies. Acme has an admin, a member, and workspaces 'bank' and 'shop'. Rival has one admin."""
     monkeypatch.setattr(rag, "embed", fake_embed)
-    monkeypatch.setattr(rag, "chat", lambda system, user: "Use make restart [1]")
+    monkeypatch.setattr(rag, "chat", lambda system, user: "unused")
+    monkeypatch.setattr(rag, "chat_stream", lambda system, user: iter(["Use make ", "restart [1]"]))
     tag = uuid.uuid4().hex[:8]
 
     def client():
@@ -48,15 +52,24 @@ def world(monkeypatch):
         conn.execute("DELETE FROM organisations WHERE name IN (%s, %s)", (f"Acme {tag}", f"Rival {tag}"))
 
 
+def ask(client, workspace_id, question, history=()):
+    """Posts a question and returns (status code, list of streamed JSON lines)."""
+    r = client.post(f"/workspaces/{workspace_id}/ask", json={"question": question, "history": list(history)})
+    return r.status_code, [json.loads(line) for line in r.text.splitlines()] if r.status_code == 200 else r.json()
+
+
 def test_signed_out_requests_are_refused(world):
     assert world["anonymous"].get("/me").status_code == 401
     assert world["anonymous"].post(f"/workspaces/{world['bank']}/ask", json={"question": "restart?"}).status_code == 401
 
 
 def test_admin_asks_and_gets_cited_sources(world):
-    r = world["admin"].post(f"/workspaces/{world['bank']}/ask", json={"question": "how do I restart the service?"}).json()
-    assert r["answer"] == "Use make restart [1]"
-    assert [(s["n"], s["document"], s["heading"]) for s in r["sources"]] == [(1, "runbook.md", "Deploy")]
+    status, lines = ask(world["admin"], world["bank"], "how do I restart the service?")
+    assert status == 200
+    assert lines[0]["searched_for"] == "how do I restart the service?"
+    assert [(s["n"], s["document"], s["heading"]) for s in lines[0]["sources"]] == [(1, "runbook.md", "Deploy")]
+    assert "".join(line.get("delta", "") for line in lines) == "Use make restart [1]"
+    assert lines[-1]["done"] is True and isinstance(lines[-1]["message_id"], int)
     again = world["admin"].post(f"/workspaces/{world['bank']}/documents", files={"file": ("copy.md", b"# Deploy\nRestart the payment service with make restart.\n")})
     assert again.json()["status"] == "duplicate"
 
@@ -64,7 +77,8 @@ def test_admin_asks_and_gets_cited_sources(world):
 def test_another_company_cannot_reach_the_workspace(world):
     rival, bank = world["rival"], world["bank"]
     assert rival.get("/me").json()["workspaces"] == []
-    assert rival.post(f"/workspaces/{bank}/ask", json={"question": "restart?"}).status_code == 404
+    assert ask(rival, bank, "restart?")[0] == 404
+    assert rival.get(f"/workspaces/{bank}/messages").status_code == 404
     assert rival.get(f"/workspaces/{bank}/documents").status_code == 404
     assert rival.post(f"/workspaces/{bank}/documents", files={"file": ("x.md", b"# x\ny\n")}).status_code == 404
     member_id = world["admin"].get("/team").json()[0]["id"]
@@ -74,14 +88,14 @@ def test_another_company_cannot_reach_the_workspace(world):
 def test_member_sees_only_assigned_workspaces(world):
     admin, member, bank, shop = world["admin"], world["member"], world["bank"], world["shop"]
     assert member.get("/me").json()["workspaces"] == []
-    assert member.post(f"/workspaces/{bank}/ask", json={"question": "restart?"}).status_code == 404
+    assert ask(member, bank, "restart?")[0] == 404
     assert member.post("/workspaces", json={"name": "mine"}).status_code == 403
     assert member.get("/team").status_code == 403
 
     member_id = next(m["id"] for m in admin.get("/team").json() if m["role"] == "member")
     assert admin.put(f"/workspaces/{bank}/members/{member_id}").status_code == 200
     assert [w["name"] for w in member.get("/me").json()["workspaces"]] == ["bank"]
-    assert member.post(f"/workspaces/{bank}/ask", json={"question": "restart?"}).status_code == 200
+    assert ask(member, bank, "restart?")[0] == 200
     assert member.get(f"/workspaces/{shop}/documents").status_code == 404
 
     assert admin.delete(f"/workspaces/{bank}/members/{member_id}").status_code == 200
@@ -124,3 +138,73 @@ def test_password_hash_roundtrip():
     stored = auth.hash_password("correct horse")
     assert "correct horse" not in stored
     assert auth.check_password("correct horse", stored) and not auth.check_password("wrong", stored)
+
+
+def test_keyword_search_finds_exact_terms(world):
+    """Twelve look-alike pages and one that holds the exact setting name: hybrid search ranks that one first.
+    With keyword=False this fails (checked), so it really tests the keyword half."""
+    admin, shop = world["admin"], world["shop"]
+    for i in range(12):
+        admin.post(f"/workspaces/{shop}/documents", files={"file": (f"filler-{i}.md", f"# Notes {i}\nWhat does this do and what does that do, page {i}.\n".encode())})
+    admin.post(f"/workspaces/{shop}/documents", files={"file": ("settings.md", b"# Memory\nSet OLLAMA_KEEP_ALIVE to 10m to unload sooner.\n")})
+    with admin_db() as conn:
+        hits = rag.search(conn, shop, "what does OLLAMA_KEEP_ALIVE do?", k=3)
+        assert hits[0]["document"] == "settings.md"
+        assert rag.search(conn, shop, "error: code !& | :* ' ) (", k=3) is not None  # odd input cannot break the query
+
+
+def test_follow_up_question_is_rewritten_before_search(world, monkeypatch):
+    seen = []
+    monkeypatch.setattr(rag, "chat", lambda system, user: seen.append(user) or "How do I restart the payment service?")
+    history = [{"question": "What does the payment service do?", "answer": "It takes payments [1]"}]
+    status, lines = ask(world["admin"], world["bank"], "and how do I restart it?", history)
+    assert status == 200 and lines[0]["searched_for"] == "How do I restart the payment service?"
+    assert "What does the payment service do?" in seen[0] and "and how do I restart it?" in seen[0]
+    _, lines = ask(world["admin"], world["bank"], "first question")
+    assert lines[0]["searched_for"] == "first question"  # no history, no rewrite call
+    assert len(seen) == 1
+
+
+def test_history_and_feedback_are_private(world):
+    admin, member, rival, bank = world["admin"], world["member"], world["rival"], world["bank"]
+    _, lines = ask(admin, bank, "how do I restart the service?")
+    message_id = lines[-1]["message_id"]
+
+    history = admin.get(f"/workspaces/{bank}/messages").json()
+    assert [(m["id"], m["question"], m["answer"], m["feedback"]) for m in history] == [
+        (message_id, "how do I restart the service?", "Use make restart [1]", None)
+    ]
+    assert history[0]["sources"][0]["document"] == "runbook.md"
+
+    assert admin.put(f"/messages/{message_id}/feedback", json={"value": 1}).status_code == 200
+    assert admin.get(f"/workspaces/{bank}/messages").json()[0]["feedback"] == 1
+    assert admin.put(f"/messages/{message_id}/feedback", json={"value": 0}).status_code == 200
+    assert admin.get(f"/workspaces/{bank}/messages").json()[0]["feedback"] is None
+    assert admin.put(f"/messages/{message_id}/feedback", json={"value": 5}).status_code == 422
+
+    # Another company, and a colleague with access to the same workspace, cannot see or rate it.
+    assert rival.put(f"/messages/{message_id}/feedback", json={"value": -1}).status_code == 404
+    member_id = next(m["id"] for m in admin.get("/team").json() if m["role"] == "member")
+    admin.put(f"/workspaces/{bank}/members/{member_id}")
+    assert member.get(f"/workspaces/{bank}/messages").json() == []
+    assert member.put(f"/messages/{message_id}/feedback", json={"value": -1}).status_code == 404
+
+
+def test_model_failure_mid_answer_is_reported_and_not_saved(world, monkeypatch):
+    def broken(system, user):
+        yield "Use make "
+        raise httpx.ReadTimeout("model stopped")
+
+    monkeypatch.setattr(rag, "chat_stream", broken)
+    status, lines = ask(world["admin"], world["bank"], "how do I restart the service?")
+    assert status == 200 and "Ollama" in lines[-1]["error"]
+    assert world["admin"].get(f"/workspaces/{world['bank']}/messages").json() == []
+
+
+def test_model_down_before_answer_is_a_502(world, monkeypatch):
+    def down(texts):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(rag, "embed", down)
+    status, body = ask(world["admin"], world["bank"], "anything")
+    assert status == 502 and "Ollama" in body["detail"]

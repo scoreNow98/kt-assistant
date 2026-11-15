@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -7,7 +8,8 @@ import httpx
 import psycopg
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
 import auth
@@ -37,13 +39,14 @@ app.add_middleware(
 )
 
 
+def model_down_message() -> str:
+    return f"Cannot use the model server at {rag.LLM_BASE_URL}. Is Ollama running, and are the models pulled?"
+
+
 @app.exception_handler(httpx.HTTPError)
 def model_server_error(request, exc):
     log.error("model server call failed: %r", exc)
-    return JSONResponse(
-        status_code=502,
-        content={"detail": f"Cannot use the model server at {rag.LLM_BASE_URL}. Is Ollama running, and are the models pulled?"},
-    )
+    return JSONResponse(status_code=502, content={"detail": model_down_message()})
 
 
 # ---------- who is asking ----------
@@ -238,8 +241,18 @@ def remove_member(workspace_id: int, member_id: int, user: Admin):
 
 # ---------- documents and questions ----------
 
+class Turn(BaseModel):
+    question: str = Field(max_length=2000)
+    answer: str = Field(max_length=8000)
+
+
 class Question(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
+    history: list[Turn] = Field(default=[], max_length=2)
+
+
+class Feedback(BaseModel):
+    value: Literal[-1, 0, 1]  # 0 clears it
 
 
 @app.post("/workspaces/{workspace_id}/documents")
@@ -269,9 +282,60 @@ def documents(workspace_id: int, user: User):
 
 @app.post("/workspaces/{workspace_id}/ask")
 def ask(workspace_id: int, body: Question, user: User):
+    """Streams newline-separated JSON: {searched_for, sources}, then {delta} pieces, then {done, message_id}.
+
+    Model errors before the first line become a normal 502; after it, an {error} line.
+    """
     with user_db(user["id"]) as conn:
         open_workspace(conn, workspace_id)
-        return rag.ask(conn, workspace_id, body.question)
+        standalone = rag.rewrite(body.question, [t.model_dump() for t in body.history])
+        sources = rag.search(conn, workspace_id, standalone)
+
+    def lines():
+        yield json.dumps({"searched_for": standalone, "sources": sources}) + "\n"
+        answer = ""
+        try:
+            for piece in rag.answer_stream(sources, standalone):
+                answer += piece
+                yield json.dumps({"delta": piece}) + "\n"
+        except httpx.HTTPError as e:
+            log.error("model server call failed: %r", e)
+            yield json.dumps({"error": model_down_message()}) + "\n"
+            return
+        with user_db(user["id"]) as conn:
+            message_id = conn.execute(
+                "INSERT INTO messages (workspace_id, user_id, question, searched_for, answer, sources) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                (workspace_id, user["id"], body.question, standalone, answer, Jsonb(sources)),
+            ).fetchone()[0]
+        yield json.dumps({"done": True, "message_id": message_id}) + "\n"
+
+    return StreamingResponse(lines(), media_type="application/x-ndjson")
+
+
+@app.get("/workspaces/{workspace_id}/messages")
+def messages(workspace_id: int, user: User):
+    """This user's last 20 questions in the workspace, oldest first."""
+    with user_db(user["id"]) as conn:
+        open_workspace(conn, workspace_id)
+        rows = conn.execute(
+            "SELECT * FROM (SELECT id, question, searched_for, answer, sources, feedback FROM messages "
+            "WHERE workspace_id = %s ORDER BY id DESC LIMIT 20) recent ORDER BY id",
+            (workspace_id,),
+        ).fetchall()
+    keys = ("id", "question", "searched_for", "answer", "sources", "feedback")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+@app.put("/messages/{message_id}/feedback")
+def feedback(message_id: int, body: Feedback, user: User):
+    with user_db(user["id"]) as conn:
+        updated = conn.execute(
+            "UPDATE messages SET feedback = NULLIF(%s, 0) WHERE id = %s", (body.value, message_id)
+        ).rowcount
+    if not updated:
+        raise HTTPException(404, "Message not found")
+    return {"ok": True}
 
 
 @app.get("/health")

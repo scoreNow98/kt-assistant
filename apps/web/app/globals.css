@@ -638,3 +638,52 @@ td {
     background: var(--surface);
   }
 }
+
+/* ---------- phase 3: follow-ups, streaming, feedback ---------- */
+
+.searched {
+  color: var(--muted);
+  font-size: 0.8125rem;
+  margin: -0.4rem 0 0.75rem;
+}
+
+/* A thin caret while the answer is still being written. */
+.prose[aria-busy="true"]::after {
+  content: "";
+  display: inline-block;
+  width: 0.5em;
+  height: 1.1em;
+  margin-left: 0.15em;
+  vertical-align: -0.15em;
+  background: var(--mark);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .prose[aria-busy="true"]::after {
+    animation: caret 1s steps(2) infinite;
+  }
+}
+
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+.rate {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.rate button {
+  font-size: 0.8125rem;
+  padding: 0.2rem 0.65rem;
+  color: var(--muted);
+}
+
+.rate button[aria-pressed="true"] {
+  color: var(--ink);
+  border-color: var(--ink);
+  font-weight: 600;
+}

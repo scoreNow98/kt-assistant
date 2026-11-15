@@ -2,7 +2,7 @@
 
 Knowledge-transfer assistant for service teams: one workspace per client, answers with links to the source document.
 
-Status: **phase 2, accounts and client workspaces**. A company signs up, creates one workspace per client, invites people and chooses who can open which client. Answers come with numbered sources beside them.
+Status: **phase 3, answer quality**. Search combines meaning (vectors) with exact words (keywords), follow-up questions are understood, answers stream in as they are written, and each person's questions are saved with a helpful / not helpful rating. Phase 2 accounts and per-client access are unchanged.
 
 ## One-time setup
 
@@ -49,7 +49,7 @@ Invites are links the admin copies and sends; the app does not send email.
 
 ```bash
 docker compose exec api pytest                           # includes the cross-company leak tests
-docker compose exec api python eval.py you@example.com   # do 20 test questions find the right document?
+docker compose exec api python eval.py you@example.com   # do 30 test questions find the right document?
 ```
 
 ## Change the models
@@ -74,6 +74,8 @@ infra/        database setup
 scripts/      helper scripts
 ```
 
-## Next: phase 3
+`eval.py` prints two scores: vector search alone, and the hybrid search the app uses. The last 10 questions are harder on purpose: exact setting names and loosely worded questions.
 
-Answer quality: keyword search next to vector search, streaming answers, chat history, feedback.
+## Next: phase 4
+
+Knowledge-transfer features: a gap report of questions the documents could not answer, an onboarding path per client, and exit capture.
