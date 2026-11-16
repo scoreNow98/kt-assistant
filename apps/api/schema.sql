@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS invites (
   used_at timestamptz
 );
 
+-- Lets an admin list and revoke pending invites without handling the secret token.
+ALTER TABLE invites ADD COLUMN IF NOT EXISTS id bigserial UNIQUE;
+
 CREATE TABLE IF NOT EXISTS workspaces (
   id bigserial PRIMARY KEY,
   org_id bigint NOT NULL REFERENCES organisations (id) ON DELETE CASCADE,
@@ -63,6 +66,9 @@ CREATE TABLE IF NOT EXISTS documents (
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (workspace_id, sha256)
 );
+
+-- Who uploaded it: they may remove or replace it. Empty for command-line loads and older documents (admins only).
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS uploaded_by bigint REFERENCES users (id) ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS chunks (
   id bigserial PRIMARY KEY,
@@ -98,6 +104,13 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS messages_workspace_user ON messages (workspace_id, user_id, id);
+-- not_found: the answer said so, or cited none of its sources (set by the API). dismissed: an admin took it
+-- off the gap report. Older answers are marked by the not-found sentence, as the gap report used to do.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS not_found boolean NOT NULL DEFAULT false;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS dismissed boolean NOT NULL DEFAULT false;
+-- removed: the person removed it; its text is wiped, the row stays so this month's question count stays right.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS removed boolean NOT NULL DEFAULT false;
+UPDATE messages SET not_found = true WHERE NOT not_found AND answer ILIKE '%could not find this in the documents%';
 
 -- The saved "Start here" guide, one per workspace.
 CREATE TABLE IF NOT EXISTS guides (
@@ -106,6 +119,8 @@ CREATE TABLE IF NOT EXISTS guides (
   reading_order jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+-- The documents the guide was written from, to tell when it is out of date. Empty for older guides.
+ALTER TABLE guides ADD COLUMN IF NOT EXISTS document_ids bigint[];
 
 -- Row-level security: client data is read and written by the kt_app login, which only sees workspaces
 -- the signed-in person may open. The API filters too; this is the second lock.
@@ -153,6 +168,12 @@ GRANT EXECUTE ON FUNCTION kt_user_id(), kt_org_id(), kt_is_admin(), kt_is_member
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON workspaces, workspace_members, documents, chunks, messages, guides TO kt_app;
 REVOKE ALL ON organisations, users, sessions, invites FROM kt_app;  -- phase 2-5 granted some user columns
+-- People rate their own answers; whether an answer was found, and gap dismissals, are set by the API only.
+REVOKE UPDATE ON messages FROM kt_app;
+GRANT UPDATE (feedback) ON messages TO kt_app;
+-- Removing a question wipes it through the API (admin_db, the caller's own only); workspace and person
+-- deletion still remove messages by cascade.
+REVOKE DELETE ON messages FROM kt_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO kt_app;
 DO $$ BEGIN
   EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
@@ -192,13 +213,24 @@ CREATE POLICY message_access ON messages USING (
 DROP POLICY IF EXISTS guide_access ON guides;
 CREATE POLICY guide_access ON guides USING (workspace_id IN (SELECT id FROM workspaces));
 
--- Deleting, and writing the guide, are for admins only, here as well as in the API.
+-- Deleting, and writing the guide, are for admins only, here as well as in the API. One exception: whoever
+-- uploaded a document may delete it (its chunks go with it by cascade, which row-level security does not stop).
 DROP POLICY IF EXISTS admin_delete ON workspaces;
 CREATE POLICY admin_delete ON workspaces AS RESTRICTIVE FOR DELETE USING (kt_is_admin());
 DROP POLICY IF EXISTS admin_delete ON workspace_members;
 CREATE POLICY admin_delete ON workspace_members AS RESTRICTIVE FOR DELETE USING (kt_is_admin());
 DROP POLICY IF EXISTS admin_delete ON documents;
-CREATE POLICY admin_delete ON documents AS RESTRICTIVE FOR DELETE USING (kt_is_admin());
+DROP POLICY IF EXISTS admin_or_uploader_delete ON documents;
+CREATE POLICY admin_or_uploader_delete ON documents AS RESTRICTIVE FOR DELETE
+  USING (kt_is_admin() OR uploaded_by = kt_user_id());
+-- A new document is recorded as the caller's own, and only admins change documents or chunks afterwards,
+-- so nobody can make someone else's document "theirs" or move chunks under their own document to delete them.
+DROP POLICY IF EXISTS own_upload ON documents;
+CREATE POLICY own_upload ON documents AS RESTRICTIVE FOR INSERT WITH CHECK (uploaded_by = kt_user_id());
+DROP POLICY IF EXISTS admin_update ON documents;
+CREATE POLICY admin_update ON documents AS RESTRICTIVE FOR UPDATE USING (kt_is_admin());
+DROP POLICY IF EXISTS admin_update ON chunks;
+CREATE POLICY admin_update ON chunks AS RESTRICTIVE FOR UPDATE USING (kt_is_admin());
 DROP POLICY IF EXISTS admin_delete ON chunks;
 CREATE POLICY admin_delete ON chunks AS RESTRICTIVE FOR DELETE USING (kt_is_admin());
 DROP POLICY IF EXISTS admin_insert ON guides;

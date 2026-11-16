@@ -310,7 +310,10 @@ def test_handover_notes_become_a_searchable_document(world):
     assert name in [d["name"] for d in admin.get(f"/workspaces/{bank}/documents").json()]
     with admin_db() as conn:
         hits = rag.search(conn, bank, "who owns the billing database", k=1)
-    assert hits[0]["document"] == name and hits[0]["heading"] == "Who owns the billing database?"
+    # The heading path keeps the notes' title as parent; no full email address in it.
+    heading = hits[0]["heading"]
+    assert hits[0]["document"] == name and heading.startswith(f"Handover notes from lead-{tag}, ")
+    assert heading.endswith(" > Who owns the billing database?") and "@" not in heading
     assert "breaks" not in hits[0]["text"]
 
     assert admin.post(f"/workspaces/{bank}/handover", json={"answers": answers[1:]}).status_code == 400
@@ -510,3 +513,387 @@ def test_database_lets_only_admins_delete(world):
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("INSERT INTO guides (workspace_id, sections, reading_order) VALUES (%s, '[]', '[]')", (bank,))
     assert len(admin.get(f"/workspaces/{bank}/documents").json()) == 1
+
+
+# ---------- hardening round ----------
+
+def member_id_of(world):
+    return next(m["id"] for m in world["admin"].get("/team").json() if m["role"] == "member")
+
+
+def give_member(world, workspace_id):
+    assert world["admin"].put(f"/workspaces/{workspace_id}/members/{member_id_of(world)}").status_code == 200
+
+
+def upload(client, workspace_id, name, data, replace=False):
+    return client.post(f"/workspaces/{workspace_id}/documents" + ("?replace=true" if replace else ""), files={"file": (name, data)})
+
+
+def test_new_endpoints_refuse_other_companies_and_members(world):
+    admin, member, rival, bank = world["admin"], world["member"], world["rival"], world["bank"]
+    give_member(world, bank)
+    _, lines = ask(admin, bank, "how do I restart the service?")
+    message_id = lines[-1]["message_id"]
+    doc_id = admin.get(f"/workspaces/{bank}/documents").json()[0]["id"]
+    invite_id = admin.post("/invites", json={}).json()["id"]
+    admin_id = next(p["id"] for p in admin.get("/team").json() if p["you"])
+
+    # Another company's admin: the workspace, message, document, invite and person do not exist for them.
+    assert rival.patch(f"/workspaces/{bank}", json={"name": "taken over"}).status_code == 404
+    assert rival.delete(f"/workspaces/{bank}").status_code == 404
+    assert rival.post(f"/workspaces/{bank}/gaps/dismiss", json={"question": "x"}).status_code == 404
+    assert rival.put(f"/team/{admin_id}/role", json={"role": "member"}).status_code == 404
+    assert rival.get("/invites").json() == []
+    assert rival.delete(f"/invites/{invite_id}").status_code == 404
+    assert rival.delete(f"/messages/{message_id}").status_code == 404
+    assert rival.delete(f"/workspaces/{bank}/documents/{doc_id}").status_code == 404
+    assert rival.delete(f"/workspaces/{bank}/messages").status_code == 404
+    assert rival.get(f"/workspaces/{bank}/guide").status_code == 404
+    # A plain member of the workspace: admin actions are refused, and other people's things are not theirs.
+    assert member.patch(f"/workspaces/{bank}", json={"name": "taken over"}).status_code == 403
+    assert member.delete(f"/workspaces/{bank}").status_code == 403
+    assert member.post(f"/workspaces/{bank}/gaps/dismiss", json={"question": "x"}).status_code == 403
+    assert member.put(f"/team/{admin_id}/role", json={"role": "member"}).status_code == 403
+    assert member.get("/invites").status_code == 403
+    assert member.delete(f"/invites/{invite_id}").status_code == 403
+    assert member.delete(f"/messages/{message_id}").status_code == 404
+    assert member.delete(f"/workspaces/{bank}/documents/{doc_id}").status_code == 403
+    assert member.delete(f"/workspaces/{bank}/messages").json() == {"ok": True, "deleted": 0}  # not the admin's
+
+    # Nothing changed.
+    assert [w["name"] for w in admin.get("/me").json()["workspaces"]] == ["bank", "shop"]
+    assert [m["id"] for m in admin.get(f"/workspaces/{bank}/messages").json()] == [message_id]
+    assert [i["id"] for i in admin.get("/invites").json()] == [invite_id]
+    assert admin.get("/me").json()["role"] == "admin"
+    assert len(admin.get(f"/workspaces/{bank}/documents").json()) == 1
+
+
+def test_uploader_removes_own_document_but_not_others(world):
+    admin, member, bank = world["admin"], world["member"], world["bank"]
+    give_member(world, bank)
+    assert upload(member, bank, "mine.md", b"# Mine\nmy notes about the payment service\n").json()["status"] == "ready"
+    docs = {d["name"]: d for d in member.get(f"/workspaces/{bank}/documents").json()}
+    assert docs["mine.md"]["yours"] is True and docs["runbook.md"]["yours"] is False
+    assert docs["mine.md"]["created_at"].startswith("20")
+    assert admin.get(f"/workspaces/{bank}/documents").json()[0]["yours"] is False  # mine.md, not the admin's
+
+    assert member.delete(f"/workspaces/{bank}/documents/{docs['runbook.md']['id']}").status_code == 403
+    assert member.delete(f"/workspaces/{bank}/documents/{docs['mine.md']['id']}").status_code == 200
+    assert [d["name"] for d in admin.get(f"/workspaces/{bank}/documents").json()] == ["runbook.md"]
+    with admin_db() as conn:
+        assert conn.execute("SELECT count(*) FROM chunks WHERE document_id = %s", (docs["mine.md"]["id"],)).fetchone()[0] == 0
+
+
+def test_database_lets_uploaders_delete_only_their_own_documents(world):
+    admin, member, bank = world["admin"], world["member"], world["bank"]
+    give_member(world, bank)
+    upload(member, bank, "mine.md", b"# Mine\nmy notes\n")
+    with admin_db() as conn:
+        member_id = member_id_of(world)
+        runbook = conn.execute("SELECT id FROM documents WHERE workspace_id = %s AND name = 'runbook.md'", (bank,)).fetchone()[0]
+    with user_db(session_of(f"dev-{world['tag']}@acme.test")) as conn:  # the member, with raw SQL
+        assert conn.execute("DELETE FROM chunks").rowcount == 0
+        assert conn.execute("UPDATE documents SET uploaded_by = %s", (member_id,)).rowcount == 0  # cannot claim one
+        assert conn.execute("UPDATE chunks SET document_id = document_id").rowcount == 0
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):  # cannot record a document as someone else's
+            conn.execute("INSERT INTO documents (workspace_id, name, sha256, uploaded_by) VALUES (%s, 'x', 'x', NULL)", (bank,))
+    with user_db(session_of(f"dev-{world['tag']}@acme.test")) as conn:
+        assert conn.execute("DELETE FROM documents").rowcount == 1  # only mine.md
+    with admin_db() as conn:
+        assert conn.execute("SELECT id FROM documents WHERE workspace_id = %s", (bank,)).fetchall() == [(runbook,)]
+    with user_db(session_of(f"dev-{world['tag']}@acme.test")) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):  # whether an answer was found is the API's to say
+            conn.execute("UPDATE messages SET not_found = false, dismissed = true")
+
+
+def test_replace_needs_admin_or_uploader(world):
+    admin, member, bank = world["admin"], world["member"], world["bank"]
+    give_member(world, bank)
+    new_runbook = b"# Deploy\nRestart the payment service with make restart-all.\n"
+
+    r = upload(member, bank, "runbook.md", new_runbook)
+    assert r.status_code == 409 and r.json()["can_replace"] is False and "runbook.md" in r.json()["detail"]
+    assert upload(member, bank, "runbook.md", new_runbook, replace=True).status_code == 403
+    r = upload(admin, bank, "runbook.md", new_runbook)
+    assert r.status_code == 409 and r.json()["can_replace"] is True
+
+    assert upload(member, bank, "notes.md", b"# Notes\nfirst\n").json()["status"] == "ready"
+    r = upload(member, bank, "notes.md", b"# Notes\nsecond\n")
+    assert r.status_code == 409 and r.json()["can_replace"] is True
+    assert upload(member, bank, "notes.md", b"# Notes\nsecond\n", replace=True).json() == {"name": "notes.md", "status": "replaced", "chunks": 1}
+    assert upload(member, bank, "notes.md", b"# Notes\nsecond\n").json()["status"] == "duplicate"  # same content again
+
+    assert upload(admin, bank, "runbook.md", new_runbook, replace=True).json()["status"] == "replaced"
+    r = upload(admin, bank, "runbook.md", b"", replace=True)
+    assert r.status_code == 400 and r.json()["detail"] == "This file is empty."
+    docs = admin.get(f"/workspaces/{bank}/documents").json()
+    assert sorted(d["name"] for d in docs) == ["notes.md", "runbook.md"]
+    _, lines = ask(admin, bank, "how do I restart the payment service?")
+    assert any("restart-all" in s["text"] for s in lines[0]["sources"])
+    assert not any("make restart." in s["text"] for s in lines[0]["sources"])  # the old one is gone
+
+
+def test_failed_replace_keeps_the_old_document(world):
+    admin, bank = world["admin"], world["bank"]
+    before = admin.get(f"/workspaces/{bank}/documents").json()
+    r = upload(admin, bank, "runbook.md", b"\x00\x00", replace=True)  # only NUL bytes: no text to store
+    assert r.status_code == 400
+    assert admin.get(f"/workspaces/{bank}/documents").json() == before  # same document, same id
+
+
+def test_upload_file_names_are_cleaned(world):
+    admin, bank = world["admin"], world["bank"]
+    assert main.clean_file_name("a\x07b\u202e\x00.md") == "ab.md"  # control and invisible direction characters
+    assert main.clean_file_name(" /\x01 ") == main.clean_file_name(None) == "upload"
+    assert upload(admin, bank, "..\\..\\secret/dir/ab.md", b"# A\nfirst text\n").json()["name"] == "ab.md"
+    long = "n" * 300 + ".md"
+    assert upload(admin, bank, long, b"# Long\nsecond text\n").json()["name"] == "n" * 197 + ".md"
+    with admin_db() as conn:
+        names = [r[0] for r in conn.execute("SELECT name FROM documents WHERE workspace_id = %s", (bank,))]
+    assert "ab.md" in names and all(len(n) <= 200 for n in names)
+
+
+def test_ask_trims_and_flags_not_found(world, monkeypatch):
+    admin, bank = world["admin"], world["bank"]
+    assert ask(admin, bank, "   ")[0] == 422
+    status, lines = ask(admin, bank, "  how do I restart the service?  ")
+    assert status == 200 and lines[0]["searched_for"] == "how do I restart the service?"
+    assert lines[-1]["not_found"] is False
+    assert isinstance(lines[0]["sources"][0]["distance"], float)
+
+    for reply in ("Use make restart.", "Use make restart [7]."):  # no citation; a citation of no source shown
+        monkeypatch.setattr(rag, "chat_stream", lambda s, u, reply=reply: iter([reply]))
+        assert ask(admin, bank, "how do I restart the service?")[1][-1]["not_found"] is True
+    history = admin.get(f"/workspaces/{bank}/messages").json()
+    assert [m["not_found"] for m in history] == [False, True, True]
+    assert history[0]["question"] == "how do I restart the service?" and history[0]["created_at"].startswith("20")
+
+
+def test_relevance_gate_answers_not_found_without_the_model(world, monkeypatch):
+    admin, bank = world["admin"], world["bank"]
+    calls = []
+    monkeypatch.setattr(rag, "chat_stream", lambda s, u: calls.append(u) or iter(["Use make restart [1]"]))
+    monkeypatch.setattr(rag, "MAX_DISTANCE", 0.0001)
+    _, lines = ask(admin, bank, "restart the payment database")  # shares keywords, but is not close enough
+    assert lines[0]["sources"] == [] and lines[-1]["not_found"] is True and calls == []
+    assert "".join(line.get("delta", "") for line in lines) == rag.NOT_FOUND
+    monkeypatch.setattr(rag, "MAX_DISTANCE", 2.0)
+    _, lines = ask(admin, bank, "restart the payment database")
+    assert lines[0]["sources"] and lines[-1]["not_found"] is False and len(calls) == 1
+
+
+def test_busy_assistant_answers_429(world, monkeypatch):
+    import threading
+
+    admin, bank = world["admin"], world["bank"]
+    slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(main, "_answer_slots", slots)
+    slots.acquire()  # someone else's answer is being written
+    status, body = ask(admin, bank, "restart?")
+    assert status == 429 and body["detail"] == "The assistant is busy. Try again in a moment."
+    assert admin.post(f"/workspaces/{bank}/guide").status_code == 429
+    slots.release()
+    for _ in range(2):  # each finished answer gives its slot back
+        assert ask(admin, bank, "restart?")[0] == 200
+    assert admin.post(f"/workspaces/{bank}/guide").status_code == 200
+
+    def down(texts):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(rag, "embed", down)
+    assert ask(admin, bank, "restart?")[0] == 502  # failing before the stream also gives it back
+    monkeypatch.setattr(rag, "embed", fake_embed)
+    assert ask(admin, bank, "restart?")[0] == 200
+
+
+def test_people_delete_only_their_own_questions(world):
+    admin, member, bank = world["admin"], world["member"], world["bank"]
+    give_member(world, bank)
+    mine = [ask(member, bank, f"question {i}?")[1][-1]["message_id"] for i in range(3)]
+    theirs = ask(admin, bank, "admin question?")[1][-1]["message_id"]
+
+    assert member.delete(f"/messages/{theirs}").status_code == 404
+    assert member.delete(f"/messages/{mine[0]}").json() == {"ok": True}
+    assert member.delete(f"/messages/{mine[0]}").status_code == 404
+    assert [m["id"] for m in member.get(f"/workspaces/{bank}/messages").json()] == mine[1:]
+    assert member.delete(f"/workspaces/{bank}/messages").json() == {"ok": True, "deleted": 2}
+    assert member.get(f"/workspaces/{bank}/messages").json() == []
+    assert [m["id"] for m in admin.get(f"/workspaces/{bank}/messages").json()] == [theirs]
+
+
+def test_gap_closes_after_a_found_answer_and_after_dismiss(world, monkeypatch):
+    admin, member, bank = world["admin"], world["member"], world["bank"]
+    give_member(world, bank)
+    monkeypatch.setattr(rag, "chat_stream", lambda s, u: iter([rag.NOT_FOUND]))
+    ask(member, bank, "Who owns billing?")
+    ask(member, bank, "asdf qwerty")
+    gap_questions = lambda: [g["question"] for g in member.get(f"/workspaces/{bank}/gaps").json()]
+    assert sorted(gap_questions()) == ["Who owns billing?", "asdf qwerty"]
+
+    # Someone hands the answer over; the question is asked again and answered: the gap closes by itself.
+    monkeypatch.setattr(rag, "chat_stream", lambda s, u: iter(["Priya owns it [1]."]))
+    ask(admin, bank, "who owns billing?")
+    assert gap_questions() == ["asdf qwerty"]
+    # ...but an answer marked not helpful keeps it open.
+    _, lines = ask(member, bank, "Who owns billing?")
+    member.put(f"/messages/{lines[-1]['message_id']}/feedback", json={"value": -1})
+    assert sorted(gap_questions()) == ["Who owns billing?", "asdf qwerty"]
+
+    assert member.post(f"/workspaces/{bank}/gaps/dismiss", json={"question": "ASDF QWERTY"}).status_code == 403
+    assert admin.post(f"/workspaces/{bank}/gaps/dismiss", json={"question": "ASDF QWERTY"}).json() == {"ok": True, "dismissed": 1}
+    assert gap_questions() == ["Who owns billing?"]
+    assert admin.post(f"/workspaces/{bank}/gaps/dismiss", json={"question": "asdf qwerty"}).json()["dismissed"] == 0
+
+
+def test_gap_window_is_30_days(world, monkeypatch):
+    admin, bank = world["admin"], world["bank"]
+    monkeypatch.setattr(rag, "chat_stream", lambda s, u: iter([rag.NOT_FOUND]))
+    ask(admin, bank, "old question?")
+    ask(admin, bank, "recent question?")
+    with admin_db() as conn:
+        conn.execute("UPDATE messages SET created_at = now() - interval '31 days' WHERE workspace_id = %s AND question = 'old question?'", (bank,))
+        conn.execute("UPDATE messages SET created_at = now() - interval '29 days' WHERE workspace_id = %s AND question = 'recent question?'", (bank,))
+    assert [g["question"] for g in admin.get(f"/workspaces/{bank}/gaps").json()] == ["recent question?"]
+
+
+def test_workspace_rename_delete_and_duplicate_names(world):
+    admin, member, bank, shop = world["admin"], world["member"], world["bank"], world["shop"]
+    give_member(world, bank)
+    assert admin.post("/workspaces", json={"name": "  BANK "}).status_code == 409
+    assert admin.post("/workspaces", json={"name": "   "}).status_code == 422
+    assert admin.post("/workspaces", json={"name": "x" * 61}).status_code == 422
+    r = admin.post("/workspaces", json={"name": "  Client \t  C  "})
+    assert r.status_code == 200 and r.json()["name"] == "Client C"
+
+    assert admin.patch(f"/workspaces/{shop}", json={"name": "Bank"}).status_code == 409
+    assert admin.patch(f"/workspaces/{bank}", json={"name": "Bank"}).json() == {"id": bank, "name": "Bank"}  # own name, other case
+    assert admin.patch(f"/workspaces/{bank}", json={"name": " Bank  Ltd "}).json() == {"id": bank, "name": "Bank Ltd"}
+    assert member.get("/me").json()["workspaces"] == [{"id": bank, "name": "Bank Ltd"}]
+
+    ask(member, bank, "restart?")
+    admin.post(f"/workspaces/{bank}/guide")
+    assert admin.delete(f"/workspaces/{bank}").json() == {"ok": True}
+    assert member.get(f"/workspaces/{bank}/documents").status_code == 404
+    assert admin.get(f"/workspaces/{bank}/messages").status_code == 404
+    with admin_db() as conn:
+        for table in ("documents", "chunks", "messages", "guides", "workspace_members"):
+            assert conn.execute(f"SELECT count(*) FROM {table} WHERE workspace_id = %s", (bank,)).fetchone()[0] == 0
+    assert [w["name"] for w in admin.get("/me").json()["workspaces"]] == ["Client C", "shop"]
+    assert admin.delete(f"/workspaces/{bank}").status_code == 404
+
+
+def test_role_change(world):
+    admin, member = world["admin"], world["member"]
+    admin_id = next(p["id"] for p in admin.get("/team").json() if p["you"])
+    assert admin.put(f"/team/{admin_id}/role", json={"role": "member"}).status_code == 400
+    assert admin.put(f"/team/{member_id_of(world)}/role", json={"role": "owner"}).status_code == 422
+    member_id = member_id_of(world)
+    assert admin.put(f"/team/{member_id}/role", json={"role": "admin"}).json() == {"ok": True}
+    assert member.get("/me").json()["role"] == "admin" and member.get("/team").status_code == 200
+    assert len(member.get("/me").json()["workspaces"]) == 2  # admins see every workspace
+    assert member.put(f"/team/{admin_id}/role", json={"role": "member"}).status_code == 200
+    assert admin.get("/team").status_code == 403
+
+
+def test_invites_are_listed_and_revoked(world):
+    admin, rival, tag = world["admin"], world["rival"], world["tag"]
+    first = admin.post("/invites", json={}).json()
+    second = admin.post("/invites", json={"role": "admin"}).json()
+    rival.post("/invites", json={})
+    listed = admin.get("/invites").json()
+    assert [(i["id"], i["role"]) for i in listed] == [(second["id"], "admin"), (first["id"], "member")]  # the used one is not listed
+    assert listed[0]["expires_at"].startswith("20") and "token" not in listed[0]
+
+    assert rival.delete(f"/invites/{first['id']}").status_code == 404
+    assert admin.delete(f"/invites/{first['id']}").json() == {"ok": True}
+    assert admin.delete(f"/invites/{first['id']}").status_code == 404
+    assert [i["id"] for i in admin.get("/invites").json()] == [second["id"]]
+    with TestClient(main.app) as c:
+        r = c.post("/auth/signup", json={"email": f"late-{tag}@acme.test", "password": "correct horse", "invite": first["token"]})
+        assert r.status_code == 400
+    with admin_db() as conn:
+        conn.execute("UPDATE invites SET expires_at = now() - interval '1 second' WHERE id = %s", (second["id"],))
+    assert admin.get("/invites").json() == []
+
+
+def test_guide_goes_stale_when_documents_change(world):
+    admin, member, bank = world["admin"], world["member"], world["bank"]
+    give_member(world, bank)
+    admin.post(f"/workspaces/{bank}/guide")
+    assert member.get(f"/workspaces/{bank}/guide").json()["stale"] is False
+    upload(member, bank, "extra.md", b"# Extra\nmore about the payment service\n")
+    assert member.get(f"/workspaces/{bank}/guide").json()["stale"] is True
+    admin.post(f"/workspaces/{bank}/guide")
+    assert member.get(f"/workspaces/{bank}/guide").json()["stale"] is False
+    extra = next(d["id"] for d in member.get(f"/workspaces/{bank}/documents").json() if d["name"] == "extra.md")
+    member.delete(f"/workspaces/{bank}/documents/{extra}")
+    assert member.get(f"/workspaces/{bank}/guide").json()["stale"] is True  # removed counts too
+
+
+def test_handover_author_can_remove_their_notes(world):
+    admin, member, bank = world["admin"], world["member"], world["bank"]
+    give_member(world, bank)
+    name = member.post(f"/workspaces/{bank}/handover", json={"answers": [{"question": "q", "answer": "a"}]}).json()["name"]
+    doc = next(d for d in member.get(f"/workspaces/{bank}/documents").json() if d["name"] == name)
+    assert doc["yours"] is True
+    assert member.delete(f"/workspaces/{bank}/documents/{doc['id']}").status_code == 200
+
+
+def test_ingest_replace_loads_a_folder_again(world, tmp_path, monkeypatch):
+    import ingest
+
+    bank = world["bank"]
+    (tmp_path / "runbook.md").write_bytes(b"# Deploy\nRestart with make restart-v2.\n")
+    assert ingest.load_file(bank, "runbook.md", (tmp_path / "runbook.md").read_bytes())["status"] == "ready"  # a second runbook.md
+    assert ingest.load_file(bank, "runbook.md", b"# Deploy\nRestart with make restart-v3.\n", replace=True)["status"] == "ready"
+    with admin_db() as conn:
+        texts = [r[0] for r in conn.execute(
+            "SELECT c.text FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.workspace_id = %s AND d.name = 'runbook.md'", (bank,))]
+    assert texts == ["Restart with make restart-v3."]
+    with pytest.raises(ValueError):  # unreadable: the old one stays
+        ingest.load_file(bank, "runbook.md", b"\x00", replace=True)
+    with admin_db() as conn:
+        assert conn.execute("SELECT count(*) FROM documents WHERE workspace_id = %s AND name = 'runbook.md'", (bank,)).fetchone()[0] == 1
+
+
+def test_removed_questions_are_wiped_but_still_counted(world, monkeypatch):
+    admin, member, bank = world["admin"], world["member"], world["bank"]
+    give_member(world, bank)
+    monkeypatch.setattr(rag, "chat_stream", lambda s, u: iter([rag.NOT_FOUND]))
+    secret = ask(member, bank, "what is the billing password?")[1][-1]["message_id"]
+    assert [g["question"] for g in admin.get(f"/workspaces/{bank}/gaps").json()] == ["what is the billing password?"]
+    assert admin.get("/usage").json()["used"]["questions"] == 1
+
+    assert admin.delete(f"/messages/{secret}").status_code == 404  # another person, even an admin
+    assert member.delete(f"/messages/{secret}").json() == {"ok": True}
+    assert member.delete(f"/messages/{secret}").status_code == 404  # already removed
+    assert member.put(f"/messages/{secret}/feedback", json={"value": -1}).status_code == 404
+    assert member.get(f"/workspaces/{bank}/messages").json() == []
+    assert admin.get(f"/workspaces/{bank}/gaps").json() == []
+    assert admin.get("/usage").json()["used"]["questions"] == 1  # removing does not give questions back
+    with admin_db() as conn:
+        row = conn.execute("SELECT removed, question, searched_for, answer, sources, feedback FROM messages WHERE id = %s", (secret,)).fetchone()
+    assert row == (True, "", "", "", [], None)
+
+    ask(member, bank, "another?")
+    assert member.delete(f"/workspaces/{bank}/messages").json() == {"ok": True, "deleted": 1}  # the removed one is not counted again
+    assert admin.get("/usage").json()["used"]["questions"] == 2
+
+
+def test_app_login_cannot_hard_delete_messages(world):
+    ask(world["admin"], world["bank"], "restart?")
+    with user_db(session_of(f"lead-{world['tag']}@acme.test")) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM messages")
+    assert len(world["admin"].get(f"/workspaces/{world['bank']}/messages").json()) == 1
+
+
+def test_replace_is_allowed_at_the_document_limit(world, monkeypatch):
+    admin, bank = world["admin"], world["bank"]
+    monkeypatch.setitem(main.PLANS, "trial", {"questions": 9, "documents": 1, "people": 9})  # Acme has 1 document
+    r = upload(admin, bank, "new.md", b"# New\nanother document\n")
+    assert r.status_code == 403 and "documents" in r.json()["detail"]
+    r = upload(admin, bank, "runbook.md", b"# Deploy\nRestart with make restart-v2.\n", replace=True)
+    assert r.status_code == 200 and r.json()["status"] == "replaced"
+    assert upload(admin, bank, "copy.md", b"# Deploy\nRestart with make restart-v2.\n").json()["status"] == "duplicate"
+    assert [d["name"] for d in admin.get(f"/workspaces/{bank}/documents").json()] == ["runbook.md"]

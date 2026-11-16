@@ -916,3 +916,291 @@ td {
   font: 0.75em var(--sans);
   vertical-align: 0.3em;
 }
+
+/* ---------- hardening round: follow-ups, stop, drafts, removal, uploads, lost access, admin actions ---------- */
+
+.lost-access {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 5;
+  max-width: 24rem;
+  display: flex;
+  gap: 1rem;
+  align-items: baseline;
+  padding: 0.75rem 1rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--mark);
+  border-radius: 6px;
+}
+
+.ws-title {
+  margin-right: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem 1rem;
+}
+
+.chat .ws-title h1 {
+  margin-right: 0;
+}
+
+.ws-title > button.link {
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+.ws-title input {
+  font: 400 1.25rem var(--serif);
+  width: min(22rem, 70vw);
+}
+
+.ws-title .error {
+  flex-basis: 100%;
+  font-size: 0.8125rem;
+}
+
+/* The document menu: the list now sits inside a box that also holds the filter. */
+.docs .docs-menu {
+  position: absolute;
+  right: 0;
+  top: 1.9rem;
+  z-index: 2;
+  width: 26rem;
+  max-width: 80vw;
+  max-height: 20rem;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8125rem;
+  color: var(--ink);
+}
+
+.docs .docs-menu ul {
+  position: static;
+  width: auto;
+  max-width: none;
+  max-height: none;
+  overflow: visible;
+  border: 0;
+  padding: 0;
+  background: none;
+}
+
+.docs .name {
+  flex: 1;
+  min-width: 0;
+}
+
+.docs .added {
+  flex: none;
+  color: var(--muted);
+}
+
+.docs-filter {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-bottom: 0.5rem;
+  color: var(--muted);
+}
+
+.upload-results {
+  flex-basis: 100%;
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+  font-size: 0.8125rem;
+}
+
+.upload-results ul {
+  flex: 1;
+  max-height: 9rem;
+  overflow-y: auto;
+  border-left: 3px solid var(--mark);
+  padding-left: 0.75rem;
+}
+
+.upload-results .name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.upload-results .failed {
+  color: var(--danger);
+}
+
+.upload-results .failed .name {
+  color: var(--ink);
+}
+
+/* Quiet rule with a label, between earlier questions and this visit, and at a new topic. */
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  padding: 0.5rem 0;
+  max-width: 38rem;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--line);
+}
+
+.divider + .turn {
+  border-top: 0;
+}
+
+/* An answer the documents could not give: quiet, with a marker edge instead of the full serif voice. */
+.turn.not-found .prose {
+  color: var(--muted);
+  font-size: 1rem;
+  border-left: 3px solid var(--mark);
+  padding-left: 0.9rem;
+}
+
+.handover-hint {
+  margin-top: 0.75rem;
+  color: var(--muted);
+}
+
+.stopped {
+  color: var(--muted);
+  font-size: 0.8125rem;
+  margin-top: 0.5rem;
+}
+
+.turn-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.turn-actions button {
+  font-size: 0.8125rem;
+  padding: 0.2rem 0.65rem;
+}
+
+.rate {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.rate .row {
+  gap: 0.5rem;
+}
+
+.rate button.remove {
+  margin-left: auto;
+  padding: 0;
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+/* Ask box: a textarea that grows to six lines, with the follow-up line above it. */
+.ask {
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.ask textarea {
+  flex: 1;
+  max-width: 44rem;
+  min-width: 0;
+  padding: 0.75rem 1rem;
+  font: 1rem/1.5 var(--sans);
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid var(--muted);
+  border-radius: 6px;
+  resize: none;
+  max-height: calc(6 * 1.5em + 1.5rem + 2px);
+  overflow-y: auto;
+}
+
+.ask button {
+  min-height: 2.9rem;
+}
+
+.ask .follow-up {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
+}
+
+.ask .follow-up button.link {
+  min-height: 0;
+  padding: 0;
+  margin-left: 0.4rem;
+}
+
+.stale {
+  color: var(--mark-ink);
+  background: var(--mark-soft);
+  border-left: 3px solid var(--mark);
+  padding: 0.2rem 0.6rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .stale {
+    color: var(--ink);
+  }
+}
+
+.gaps button.dismiss {
+  font-size: 0.8125rem;
+  margin-top: 0.4rem;
+  color: var(--muted);
+}
+
+.role-select {
+  margin-left: 0.5rem;
+  font-size: 0.8125rem;
+  padding: 0.1rem 0.4rem;
+}
+
+.invites {
+  display: grid;
+  gap: 0.4rem;
+  max-width: 34rem;
+  margin-bottom: 0.5rem;
+}
+
+.invites li {
+  display: flex;
+  gap: 1rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.invites li button {
+  margin-left: auto;
+}
+
+@media (max-width: 44rem) {
+  .lost-access {
+    left: 1rem;
+    max-width: none;
+  }
+  .upload-results {
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+}
+
+/* On phones the page itself scrolls, so the question box can stay pinned to the bottom of the screen. */
+@media (max-width: 44rem) {
+  main {
+    overflow-y: visible;
+  }
+}

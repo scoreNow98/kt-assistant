@@ -2,117 +2,214 @@
   {
     "workspace": "client-a",
     "question": "How do I allow requests from a frontend on a different origin?",
-    "expect": "tutorial/cors.md"
+    "expect": "tutorial/cors.md",
+    "must_contain": [
+      "CORSMiddleware",
+      "allow_origins",
+      "allow_credentials"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I run a task after returning the response?",
-    "expect": "tutorial/background-tasks.md"
+    "expect": "tutorial/background-tasks.md",
+    "must_contain": [
+      "BackgroundTasks",
+      "add_task"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I accept an uploaded file in an endpoint?",
-    "expect": "tutorial/request-files.md"
+    "expect": "tutorial/request-files.md",
+    "must_contain": [
+      "UploadFile",
+      "python-multipart"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I write tests for my API endpoints?",
-    "expect": "tutorial/testing.md"
+    "expect": "tutorial/testing.md",
+    "must_contain": [
+      "TestClient",
+      "pytest"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I read a value from a request header?",
-    "expect": "tutorial/header-params.md"
+    "expect": "tutorial/header-params.md",
+    "must_contain": [
+      "Header",
+      "convert_underscores"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I return a 404 error to the client?",
-    "expect": "tutorial/handling-errors.md"
+    "expect": "tutorial/handling-errors.md",
+    "must_contain": [
+      "HTTPException"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I split the application into several files with routers?",
-    "expect": "tutorial/bigger-applications.md"
+    "expect": "tutorial/bigger-applications.md",
+    "must_contain": [
+      "APIRouter",
+      "include_router"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I protect endpoints with JWT tokens?",
-    "expect": "tutorial/security/oauth2-jwt.md"
+    "expect": "tutorial/security/oauth2-jwt.md",
+    "must_contain": [
+      "PyJWT",
+      "pwdlib"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I serve static files such as images?",
-    "expect": "tutorial/static-files.md"
+    "expect": "tutorial/static-files.md",
+    "must_contain": [
+      "StaticFiles",
+      "mount"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "When should I use async def instead of def?",
-    "expect": "async.md"
+    "expect": "async.md",
+    "must_contain": [
+      "async def",
+      "await"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "Which GPUs are supported?",
-    "expect": "gpu.mdx"
+    "expect": "gpu.mdx",
+    "must_contain": [
+      "NVIDIA",
+      "AMD Radeon",
+      "Compute Capability"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "How do I run it in Docker?",
-    "expect": "docker.mdx"
+    "expect": "docker.mdx",
+    "must_contain": [
+      "docker run",
+      "ollama/ollama",
+      "--gpus"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "How do I increase the context window size?",
-    "expect": "context-length.mdx"
+    "expect": "context-length.mdx",
+    "must_contain": [
+      "OLLAMA_CONTEXT_LENGTH",
+      "context length"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "How do I create a custom model with its own system prompt?",
-    "expect": "modelfile.mdx"
+    "expect": "modelfile.mdx",
+    "must_contain": [
+      "SYSTEM",
+      "FROM",
+      "ollama create"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "How do I use the OpenAI Python library with the local server?",
-    "expect": "api/openai-compatibility.mdx"
+    "expect": "api/openai-compatibility.mdx",
+    "must_contain": [
+      "from openai import OpenAI",
+      "base_url",
+      "/v1"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "How do I generate embeddings?",
-    "expect": "capabilities/embeddings.mdx"
+    "expect": "capabilities/embeddings.mdx",
+    "must_contain": [
+      "/api/embed",
+      "embed"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "How do I get JSON output that follows a schema?",
-    "expect": "capabilities/structured-outputs.mdx"
+    "expect": "capabilities/structured-outputs.mdx",
+    "must_contain": [
+      "format",
+      "model_json_schema"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "Where are the server logs?",
-    "expect": "troubleshooting.mdx"
+    "expect": "troubleshooting.mdx",
+    "must_contain": [
+      "server.log",
+      "journalctl"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "How do I import a GGUF model file?",
-    "expect": "import.mdx"
+    "expect": "import.mdx",
+    "must_contain": [
+      "FROM",
+      "ollama create",
+      "safetensors"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "How do I let the model call functions?",
-    "expect": "capabilities/tool-calling.mdx"
+    "expect": "capabilities/tool-calling.mdx",
+    "must_contain": [
+      "tools",
+      "tool_calls"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "Can I use allow_credentials together with allow_origins set to a wildcard?",
-    "expect": "tutorial/cors.md"
+    "expect": "tutorial/cors.md",
+    "must_contain": [
+      "allow_credentials",
+      "allow_origins"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "Difference between response_model and the return type annotation?",
-    "expect": "tutorial/response-model.md"
+    "expect": "tutorial/response-model.md",
+    "must_contain": [
+      "response_model",
+      "return type"
+    ]
   },
   {
     "workspace": "client-a",
     "question": "How do I add custom headers to an HTTPException?",
-    "expect": "tutorial/handling-errors.md"
+    "expect": "tutorial/handling-errors.md",
+    "must_contain": [
+      "HTTPException",
+      "headers"
+    ]
   },
   {
     "workspace": "client-a",
@@ -120,36 +217,101 @@
     "expect": [
       "dependencies-with-yield.md",
       "advanced/advanced-dependencies.md"
+    ],
+    "must_contain": [
+      "yield",
+      "finally"
     ]
   },
   {
     "workspace": "client-a",
     "question": "restrict what a token can do with scopes",
-    "expect": "oauth2-scopes.md"
+    "expect": "oauth2-scopes.md",
+    "must_contain": [
+      "SecurityScopes",
+      "scopes"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "What does OLLAMA_KEEP_ALIVE do?",
-    "expect": "faq.mdx"
+    "expect": "faq.mdx",
+    "must_contain": [
+      "OLLAMA_KEEP_ALIVE"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "where do the downloaded models live on disk",
-    "expect": "faq.mdx"
+    "expect": "faq.mdx",
+    "must_contain": [
+      "OLLAMA_MODELS",
+      ".ollama/models"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "how many requests can it serve at the same time?",
-    "expect": "faq.mdx"
+    "expect": "faq.mdx",
+    "must_contain": [
+      "OLLAMA_NUM_PARALLEL",
+      "OLLAMA_MAX_QUEUE"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "my browser extension gets blocked by the server, how do I allow it?",
-    "expect": "faq.mdx"
+    "expect": "faq.mdx",
+    "must_contain": [
+      "OLLAMA_ORIGINS"
+    ]
   },
   {
     "workspace": "client-b",
     "question": "company network needs a proxy for downloads",
-    "expect": "faq.mdx"
+    "expect": "faq.mdx",
+    "must_contain": [
+      "HTTPS_PROXY"
+    ]
+  },
+  {
+    "workspace": "client-a",
+    "question": "Who do I contact when the payments API is down in production?",
+    "expect": null
+  },
+  {
+    "workspace": "client-a",
+    "question": "What day of the week do we ship releases to production for the billing service?",
+    "expect": null
+  },
+  {
+    "workspace": "client-a",
+    "question": "What uptime SLA did we commit to in the client contract?",
+    "expect": null
+  },
+  {
+    "workspace": "client-a",
+    "question": "What was the root cause of last quarter's outage in the orders service?",
+    "expect": null
+  },
+  {
+    "workspace": "client-b",
+    "question": "Who owns the GPU budget for our shared inference cluster?",
+    "expect": null
+  },
+  {
+    "workspace": "client-b",
+    "question": "What is the internal hostname of our staging Ollama server?",
+    "expect": null
+  },
+  {
+    "workspace": "client-b",
+    "question": "Which team approves new models before we add them to the approved list?",
+    "expect": null
+  },
+  {
+    "workspace": "client-b",
+    "question": "What incidents have we had with the model server crashing in production this year?",
+    "expect": null
   }
 ]

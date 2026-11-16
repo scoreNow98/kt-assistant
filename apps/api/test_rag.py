@@ -2,12 +2,71 @@ import rag
 
 
 def test_chunk_splits_on_headings_but_not_on_code_comments():
+    # min_chars=0 turns merging off, to see the splits. Headings are now a path: "Run" sits under "Setup".
     text = "intro\n\n# Setup { #setup }\ninstall it\n```python\n# not a heading\nx = 1\n```\n## Run\nstart it\n"
-    assert rag.chunk(text) == [
+    assert rag.chunk(text, min_chars=0) == [
         ("", "intro"),
         ("Setup", "install it\n```python\n# not a heading\nx = 1\n```"),
-        ("Run", "start it"),
+        ("Setup > Run", "start it"),
     ]
+
+
+def test_chunk_heading_path_follows_levels():
+    text = "# A\n" + "a" * 400 + "\n## B\n" + "b" * 400 + "\n### C\n" + "c" * 400 + "\n## D\n" + "d" * 400 + "\n# E\n" + "e" * 400
+    assert [h for h, _ in rag.chunk(text)] == ["A", "A > B", "A > B > C", "A > D", "E"]
+
+
+def test_chunk_merges_short_sections_into_the_next_keeping_their_heading():
+    text = "# Ports\nUse 8080.\n# Env\nSet DEBUG=1.\n# Deploy\n" + "Run make deploy. " * 30 + "\n# Last\nshort"
+    assert rag.chunk(text) == [
+        ("Deploy", "Ports\nUse 8080.\n\nEnv\nSet DEBUG=1.\n\n" + ("Run make deploy. " * 30).strip()),
+        ("Last", "short"),  # nothing follows, so it stays
+    ]
+
+
+def test_chunk_uses_front_matter_title_and_drops_the_block():
+    text = '---\ntitle: "Quick start"\nsidebarTitle: Start\n---\n' + "x" * 400 + "\n## Install\n" + "y" * 400
+    assert rag.chunk(text) == [("Quick start", "x" * 400), ("Quick start > Install", "y" * 400)]
+    # A "# Title" repeating the front matter title is not doubled.
+    assert [h for h, _ in rag.chunk("---\ntitle: Quick start\n---\n# Quick start\n" + "x" * 400)] == ["Quick start"]
+    # Without a closing line it is not front matter.
+    assert rag.chunk("---\ntitle: x\n" + "z" * 400)[0][1].startswith("---")
+
+
+def test_not_found_needs_a_valid_citation():
+    sources = [{"n": 1, "document": "a.md"}, {"n": 2, "document": "b.md"}]
+    assert not rag.is_not_found("Restart it [2].", sources)
+    assert rag.is_not_found("Restart it.", sources)  # no citation
+    assert rag.is_not_found("Restart it [3].", sources)  # cites a source that was not shown
+    assert rag.is_not_found("Sorry, I could not find this in the documents [1].", sources)
+    assert rag.is_not_found(rag.NOT_FOUND, [])
+
+
+def test_eval_answers_scoring():
+    from eval_answers import score
+
+    sources = [{"n": 1, "document": "tutorial/cors.md"}, {"n": 2, "document": "tutorial/testing.md"}]
+    cors = {"workspace": "client-a", "question": "q", "expect": "tutorial/cors.md", "must_contain": ["CORSMiddleware"]}
+    assert score(cors, "Add corsmiddleware [1].", sources) == (True, "ok")
+    assert score(cors, "Add a middleware [1].", sources)[0] is False  # missing the word
+    assert score(cors, "Add CORSMiddleware [2].", sources)[0] is False  # wrong document
+    assert score(cors, "Add CORSMiddleware [1][5].", sources)[0] is False  # [5] was not a source
+    assert score(cors, rag.NOT_FOUND, sources)[0] is False
+    several = {"workspace": "client-a", "question": "q", "expect": ["a.md", "tutorial/testing.md"]}  # no must_contain
+    assert score(several, "Use TestClient [2].", sources) == (True, "ok")
+    unanswerable = {"workspace": "client-a", "question": "q", "expect": None}
+    assert score(unanswerable, rag.NOT_FOUND, sources)[0] is True
+    assert score(unanswerable, "Probably 42.", sources)[0] is True  # no citation counts as not found
+    assert score(unanswerable, "It is 42 [1].", sources)[0] is False
+
+
+def test_eval_suggests_max_distance_only_without_overlap():
+    from eval import expected, suggest_max_distance
+
+    assert suggest_max_distance([0.2, 0.3], [0.5, 0.6]) == 0.4
+    assert suggest_max_distance([0.2, 0.55], [0.5, 0.6]) is None
+    assert suggest_max_distance([0.2], []) is None
+    assert expected({"expect": None}) == [] and expected({}) == [] and expected({"expect": "a.md"}) == ["a.md"]
 
 
 def test_chunk_caps_long_text():

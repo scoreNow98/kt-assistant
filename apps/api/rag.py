@@ -22,7 +22,12 @@ MAX_CHUNKS_PER_DOCUMENT = 2000
 # What the model reads per question. Ollama's default context on most machines is about 4k tokens;
 # ~10k characters of sources plus the prompt fits in 8k (set OLLAMA_CONTEXT_LENGTH=8192, see README).
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "10000"))
-HEADING = re.compile(r"#{1,6}\s+(.+?)(?:\s*\{\s*#[^}]*\})?\s*$")  # drops a trailing {#anchor}
+HEADING = re.compile(r"(#{1,6})\s+(.+?)(?:\s*\{\s*#[^}]*\})?\s*$")  # drops a trailing {#anchor}
+FRONT_MATTER = re.compile(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
+FRONT_MATTER_TITLE = re.compile(r"^title:[ \t]*(.+?)[ \t]*$", re.M)
+MIN_SECTION_CHARS = 300  # shorter sections are merged into the next one, so tiny chunks do not fill the results
+# Optional relevance gate (cosine distance). Unset: every question gets the best passages. Tune with eval.py.
+MAX_DISTANCE = float(os.environ["MAX_DISTANCE"]) if os.getenv("MAX_DISTANCE") else None
 
 
 def extract(name: str, data: bytes) -> list[tuple[int | None, str]]:
@@ -60,14 +65,22 @@ def _extract(suffix: str, data: bytes) -> list[tuple[int | None, str]]:
     return [(None, data.decode("utf-8", errors="replace"))]
 
 
-def chunk(text: str, max_chars: int = 1500) -> list[tuple[str, str]]:
-    """Splits text into (nearest heading, text) pieces of roughly max_chars, breaking at headings and blank lines."""
-    out, heading, buf, in_code = [], "", "", False
+def chunk(text: str, max_chars: int = 1500, min_chars: int = MIN_SECTION_CHARS) -> list[tuple[str, str]]:
+    """Splits text into (heading path, text) pieces of roughly max_chars, breaking at headings and blank lines.
+
+    The heading path is "Parent > Child" from the Markdown heading levels; a YAML front matter title is the
+    root. A piece shorter than min_chars is merged into the next one, keeping its heading inside the text.
+    """
+    out, path, buf, in_code = [], [], "", False
+    if m := FRONT_MATTER.match(text):
+        text = text[m.end() :]
+        if title := FRONT_MATTER_TITLE.search(m.group(1)):
+            path = [(0, title.group(1).strip("\"'"))]
 
     def flush():
         nonlocal buf
         if buf.strip():
-            out.append((heading, buf.strip()))
+            out.append((" > ".join(h for _, h in path), buf.strip()))
         buf = ""
 
     lines = [raw[i : i + max_chars] for raw in text.splitlines() for i in range(0, len(raw) or 1, max_chars)]
@@ -77,7 +90,9 @@ def chunk(text: str, max_chars: int = 1500) -> list[tuple[str, str]]:
         m = None if in_code else HEADING.match(line)  # "# comment" inside code is not a heading
         if m:
             flush()
-            heading = m.group(1).strip()
+            level, heading = len(m.group(1)), m.group(2).strip()
+            path = [(lv, h) for lv, h in path if lv < level and h != heading]  # a "# Title" repeating the front matter title once
+            path.append((level, heading))
             continue
         if not line.strip() and len(buf) >= max_chars:
             flush()
@@ -86,7 +101,17 @@ def chunk(text: str, max_chars: int = 1500) -> list[tuple[str, str]]:
         if len(buf) >= max_chars * 2:  # text with no blank lines
             flush()
     flush()
-    return out
+
+    merged, carry = [], ""
+    for i, (heading, body) in enumerate(out):
+        joined = f"{carry}\n\n{body}" if carry else body
+        if len(joined) < min_chars and i + 1 < len(out):
+            short_heading = heading.rsplit(" > ", 1)[-1]
+            carry = f"{carry}\n\n{short_heading}\n{body}".strip() if short_heading else joined
+            continue
+        merged.append((heading, joined))
+        carry = ""
+    return merged
 
 
 def _headers() -> dict:
@@ -136,10 +161,11 @@ def _vector(v: list[float]) -> str:
     return "[" + ",".join(map(str, v)) + "]"
 
 
-def ingest(conn, workspace_id: int, name: str, data: bytes) -> dict:
+def ingest(conn, workspace_id: int, name: str, data: bytes, uploaded_by: int | None = None) -> dict:
     """Stores one file as chunks. The same file twice in a workspace is skipped.
 
-    conn decides who is asking: pass a db.user_db() connection for a signed-in user.
+    conn decides who is asking: pass a db.user_db() connection for a signed-in user, and their id as
+    uploaded_by (the database refuses anything else). Command-line loads leave it empty.
     """
     pieces = [
         (page, heading, text)
@@ -153,16 +179,16 @@ def ingest(conn, workspace_id: int, name: str, data: bytes) -> dict:
     # The caller's transaction covers all of this: a failed embedding leaves nothing behind.
     sha256 = hashlib.sha256(data).hexdigest()
     # The same file again is a duplicate, unless it was embedded with another model: then embed it afresh.
-    # (Removing the old copy needs an admin, as all deletes do; for a member it stays a duplicate.)
+    # (Removing the old copy needs an admin or its uploader; for anyone else it stays a duplicate.)
     conn.execute(
         "DELETE FROM documents d WHERE workspace_id = %s AND sha256 = %s "
         "AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id AND c.embed_model = %s)",
         (workspace_id, sha256, EMBED_MODEL),
     )
     row = conn.execute(
-        "INSERT INTO documents (workspace_id, name, sha256) VALUES (%s, %s, %s) "
+        "INSERT INTO documents (workspace_id, name, sha256, uploaded_by) VALUES (%s, %s, %s, %s) "
         "ON CONFLICT DO NOTHING RETURNING id",
-        (workspace_id, name, sha256),
+        (workspace_id, name, sha256, uploaded_by),
     ).fetchone()
     if row is None:
         return {"name": name, "status": "duplicate", "chunks": 0}
@@ -186,26 +212,33 @@ def _keywords(question: str) -> str:
 
 
 def search(conn, workspace_id: int, question: str, k: int = 8, keyword: bool = True) -> list[dict]:
-    """The k best chunks: vector and keyword results merged by reciprocal rank fusion.
+    """The k best chunks: vector and keyword results merged by reciprocal rank fusion. Each has the cosine
+    distance of its vector match, or None when only the keywords found it.
 
+    With MAX_DISTANCE set, vector matches farther than it are dropped first, and when none is left the
+    result is empty (so the answer is "not found" without asking the model), even if keywords matched.
     The workspace filter is the tenant boundary: never remove it.
     """
     rows = conn.execute(
         """
         WITH vec AS (
-          SELECT id, row_number() OVER (ORDER BY embedding <=> %(v)s::vector) AS r FROM chunks
+          SELECT id, row_number() OVER (ORDER BY embedding <=> %(v)s::vector) AS r, embedding <=> %(v)s::vector AS distance
+          FROM chunks
           WHERE workspace_id = %(w)s AND embed_model = %(m)s
+            AND (%(max_d)s::float8 IS NULL OR embedding <=> %(v)s::vector <= %(max_d)s::float8)
           ORDER BY embedding <=> %(v)s::vector LIMIT 30
         ), kw AS (
           SELECT id, row_number() OVER (ORDER BY ts_rank_cd(tsv, q) DESC) AS r
           FROM chunks, to_tsquery('english', %(q)s) q
           WHERE %(use_kw)s AND workspace_id = %(w)s AND embed_model = %(m)s AND tsv @@ q
+            AND (%(max_d)s::float8 IS NULL OR EXISTS (SELECT 1 FROM vec))
           ORDER BY ts_rank_cd(tsv, q) DESC LIMIT 30
         ), fused AS (
-          SELECT id, sum(1.0 / (60 + r)) AS score FROM (SELECT * FROM vec UNION ALL SELECT * FROM kw) hits GROUP BY id
+          SELECT id, sum(1.0 / (60 + r)) AS score
+          FROM (SELECT id, r FROM vec UNION ALL SELECT id, r FROM kw) hits GROUP BY id
         )
-        SELECT d.name, c.heading, c.page, c.text FROM fused f
-        JOIN chunks c ON c.id = f.id JOIN documents d ON d.id = c.document_id
+        SELECT d.name, c.heading, c.page, c.text, v.distance FROM fused f
+        JOIN chunks c ON c.id = f.id JOIN documents d ON d.id = c.document_id LEFT JOIN vec v ON v.id = f.id
         ORDER BY f.score DESC, c.id LIMIT %(k)s
         """,
         {
@@ -215,11 +248,13 @@ def search(conn, workspace_id: int, question: str, k: int = 8, keyword: bool = T
             "q": _keywords(question),
             "use_kw": keyword,
             "k": k,
+            "max_d": MAX_DISTANCE,
         },
     ).fetchall()
     return [
-        {"n": n, "document": name, "heading": heading, "page": page, "text": text}
-        for n, (name, heading, page, text) in enumerate(rows, 1)
+        {"n": n, "document": name, "heading": heading, "page": page, "text": text,
+         "distance": None if distance is None else round(float(distance), 4)}
+        for n, (name, heading, page, text, distance) in enumerate(rows, 1)
     ]
 
 
@@ -243,6 +278,14 @@ def cited_order(answer: str) -> list[int]:
             if int(n) not in order:
                 order.append(int(n))
     return order
+
+
+def is_not_found(answer: str, sources: list[dict]) -> bool:
+    """True when the answer says it found nothing, or cites none of the sources it was given."""
+    if NOT_FOUND.lower().removeprefix("i ").rstrip(".") in answer.lower():  # small models add words around it
+        return True
+    shown = {s["n"] for s in sources}
+    return not any(n in shown for n in cited_order(answer))
 
 
 def rewrite(question: str, history: list[dict]) -> str:

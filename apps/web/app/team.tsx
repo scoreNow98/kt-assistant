@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { api, post, type Workspace } from "./api";
+import { api, ApiError, day, errorText, post, type Workspace } from "./api";
 
 type Usage = { plan: string; used: Record<Limit, number>; limits: Record<Limit, number> };
 type Limit = "questions" | "documents" | "people";
@@ -12,6 +12,7 @@ const LIMIT_LABELS: [Limit, string][] = [
 ];
 
 type Member = { id: number; email: string; role: "admin" | "member"; workspace_ids: number[]; you: boolean };
+type Invite = { id: number; role: "admin" | "member"; expires_at: string };
 
 export default function Team({ workspaces }: { workspaces: Workspace[] }) {
   const [members, setMembers] = useState<Member[]>([]);
@@ -20,15 +21,51 @@ export default function Team({ workspaces }: { workspaces: Workspace[] }) {
   const [link, setLink] = useState("");
   const [copied, setCopied] = useState(false);
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [rowError, setRowError] = useState<{ id: number; text: string } | null>(null);
+  const [invites, setInvites] = useState<Invite[] | null>(null);
+  const [inviteError, setInviteError] = useState("");
 
   const load = useCallback(
     () => api<Member[]>("/team").then(setMembers).catch((e) => setError(e.message)),
     [],
   );
+  const loadInvites = useCallback(
+    () =>
+      api<Invite[]>("/invites")
+        .then((list) => {
+          setInvites(list);
+          setInviteError("");
+        })
+        .catch((e) => setInviteError(errorText(e, "Could not load the pending invites"))),
+    [],
+  );
   useEffect(() => {
     load();
+    loadInvites();
     api<Usage>("/usage").then(setUsage).catch(() => {});
-  }, [load]);
+  }, [load, loadInvites]);
+
+  async function changeRole(member: Member, next: "admin" | "member") {
+    if (next === "admin" && !window.confirm(`Make ${member.email} an admin? Admins open every workspace and manage the team.`)) return;
+    setRowError(null);
+    try {
+      await api(`/team/${member.id}/role`, { method: "PUT", body: JSON.stringify({ role: next }) });
+    } catch (e) {
+      setRowError({ id: member.id, text: errorText(e, "Could not change the role. Try again.") });
+    }
+    load();
+  }
+
+  async function revoke(invite: Invite) {
+    setInviteError("");
+    try {
+      await api(`/invites/${invite.id}`, { method: "DELETE" });
+    } catch (e) {
+      // 404: already used, expired or revoked; the refreshed list shows that.
+      if (!(e instanceof ApiError && e.status === 404)) setInviteError(errorText(e, "Could not revoke the invite. Try again."));
+    }
+    loadInvites();
+  }
 
   async function toggle(member: Member, workspace: Workspace, allowed: boolean) {
     try {
@@ -58,6 +95,7 @@ export default function Team({ workspaces }: { workspaces: Workspace[] }) {
       setLink(`${window.location.origin}/?invite=${r.token}`);
       setCopied(false);
       setError("");
+      loadInvites();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not create the invite link");
     }
@@ -117,6 +155,26 @@ export default function Team({ workspaces }: { workspaces: Workspace[] }) {
       </section>
 
       <section>
+        <h2>Pending invites</h2>
+        {inviteError && <p className="error" role="alert">{inviteError}</p>}
+        {invites?.length === 0 && <p className="quiet">No unused invite links.</p>}
+        {invites && invites.length > 0 && (
+          <ul className="invites">
+            {invites.map((inv) => (
+              <li key={inv.id}>
+                <span>Joins as {inv.role === "admin" ? "an admin" : "a member"}</span>
+                <span className="quiet">stops working on {day(inv.expires_at)}</span>
+                <button className="link" aria-label={`Revoke the invite that joins as ${inv.role}, ending ${day(inv.expires_at)}`} onClick={() => revoke(inv)}>
+                  Revoke
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {invites && invites.length > 0 && <p className="quiet">Revoke a link you sent to the wrong person. It stops working at once.</p>}
+      </section>
+
+      <section>
         <h2>Who can open which client</h2>
         <div className="table-wrap">
           <table>
@@ -134,7 +192,20 @@ export default function Team({ workspaces }: { workspaces: Workspace[] }) {
                 <tr key={m.id}>
                   <th scope="row">
                     {m.email}
-                    {m.role === "admin" && <span className="role">admin</span>}
+                    {m.you ? (
+                      m.role === "admin" && <span className="role">admin</span>
+                    ) : (
+                      <select
+                        className="role-select"
+                        aria-label={`Role of ${m.email}`}
+                        value={m.role}
+                        onChange={(e) => changeRole(m, e.target.value as "admin" | "member")}
+                      >
+                        <option value="member">member</option>
+                        <option value="admin">admin</option>
+                      </select>
+                    )}
+                    {rowError?.id === m.id && <p className="error" role="alert">{rowError.text}</p>}
                   </th>
                   {workspaces.map((w) => (
                     <td key={w.id}>

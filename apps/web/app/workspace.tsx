@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { api, post, stream, type Source, type Workspace } from "./api";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { api, day, errorText, lostAccess, post, stream, type Doc, type Source, type Workspace } from "./api";
 import Chat, { TurnView } from "./chat";
 
 type View = "ask" | "guide" | "gaps" | "handover";
 type Section = { title: string; answer: string; sources: Source[] };
-type Guide = { sections: Section[]; reading_order: string[]; created_at: string };
+type Guide = { sections: Section[]; reading_order: string[]; created_at: string; stale?: boolean };
 type Gap = { question: string; asked: number; last_asked: string; not_found: boolean; not_helpful: boolean };
 
 const VIEWS: [View, string][] = [
@@ -16,10 +16,28 @@ const VIEWS: [View, string][] = [
   ["handover", "Hand over"],
 ];
 
-const day = (iso: string) => new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+type Props = {
+  workspace: Workspace;
+  isAdmin: boolean;
+  onChanged: () => void; // renamed: reload the workspace list
+  onDeleted: () => void;
+  onLostAccess: () => void;
+};
 
-export default function WorkspaceView({ workspace, isAdmin }: { workspace: Workspace; isAdmin: boolean }) {
+export default function WorkspaceView({ workspace, isAdmin, onChanged, onDeleted, onLostAccess }: Props) {
   const [view, setView] = useState<View>("ask");
+  // Several calls can answer 404 at once; report lost access once, through a stable callback.
+  const latest = useRef(onLostAccess);
+  const reported = useRef(false);
+  useEffect(() => {
+    latest.current = onLostAccess;
+  }, [onLostAccess]);
+  const lose = useCallback(() => {
+    if (reported.current) return;
+    reported.current = true;
+    latest.current();
+  }, []);
+  const title = <WorkspaceTitle workspace={workspace} isAdmin={isAdmin} onChanged={onChanged} onDeleted={onDeleted} onLostAccess={lose} />;
   const nav = (
     <nav className="tabs" aria-label={`${workspace.name} sections`}>
       {VIEWS.map(([v, label]) => (
@@ -29,30 +47,135 @@ export default function WorkspaceView({ workspace, isAdmin }: { workspace: Works
       ))}
     </nav>
   );
-  if (view === "ask") return <Chat workspace={workspace} nav={nav} isAdmin={isAdmin} />;
   return (
-    <div className="panel">
-      <header>
-        <h1>{workspace.name}</h1>
-        {nav}
-      </header>
-      <div className="panel-body">
-        {view === "guide" && <GuidePage workspace={workspace} isAdmin={isAdmin} />}
-        {view === "gaps" && <GapsPage workspace={workspace} onHandover={() => setView("handover")} />}
-        {view === "handover" && <HandoverPage workspace={workspace} />}
+    <>
+      {/* The chat stays mounted on other tabs, so a running answer, the follow-up context and the draft survive. */}
+      <div hidden={view !== "ask"}>
+        <Chat
+          workspace={workspace}
+          nav={nav}
+          title={title}
+          isAdmin={isAdmin}
+          active={view === "ask"}
+          onLostAccess={lose}
+          onHandover={() => setView("handover")}
+        />
       </div>
+      {view !== "ask" && (
+        <div className="panel">
+          <header>
+            {title}
+            {nav}
+          </header>
+          <div className="panel-body">
+            {view === "guide" && <GuidePage workspace={workspace} isAdmin={isAdmin} onLostAccess={lose} />}
+            {view === "gaps" && <GapsPage workspace={workspace} isAdmin={isAdmin} onLostAccess={lose} onHandover={() => setView("handover")} />}
+            {view === "handover" && <HandoverPage workspace={workspace} onLostAccess={lose} />}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** The workspace name, with Rename and Delete workspace for admins. */
+function WorkspaceTitle({ workspace, isAdmin, onChanged, onDeleted, onLostAccess }: Props) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(workspace.name);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const id = useId();
+
+  function failed(e: unknown, fallback: string) {
+    if (lostAccess(e)) onLostAccess();
+    else setError(errorText(e, fallback));
+  }
+
+  async function rename(e: React.FormEvent) {
+    e.preventDefault();
+    const clean = name.trim().replace(/\s+/g, " ");
+    if (clean === workspace.name) {
+      setEditing(false);
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/workspaces/${workspace.id}`, { method: "PATCH", body: JSON.stringify({ name: clean }) });
+      setEditing(false);
+      onChanged();
+    } catch (err) {
+      failed(err, "Could not rename the workspace. Try again.");
+    }
+    setBusy(false);
+  }
+
+  async function remove() {
+    setBusy(true);
+    setError("");
+    try {
+      const count = (await api<Doc[]>(`/workspaces/${workspace.id}/documents`)).length;
+      const docs = count === 1 ? "its 1 document" : `its ${count} documents`;
+      if (window.confirm(`Delete ${workspace.name} with ${docs}, everyone's questions and its guide? This cannot be undone.`)) {
+        try {
+          await api(`/workspaces/${workspace.id}`, { method: "DELETE" });
+        } catch (err) {
+          if (!lostAccess(err)) throw err; // 404: someone else deleted it already
+        }
+        onDeleted();
+        return;
+      }
+    } catch (err) {
+      failed(err, "Could not delete the workspace. Try again.");
+    }
+    setBusy(false);
+  }
+
+  if (editing)
+    return (
+      <form className="ws-title" onSubmit={rename}>
+        <label htmlFor={id} className="visually-hidden">Workspace name</label>
+        <input id={id} autoFocus value={name} onChange={(e) => setName(e.target.value)} required maxLength={60} />
+        <button className="primary" disabled={busy || !name.trim()}>Save name</button>
+        <button type="button" onClick={() => setEditing(false)}>Cancel</button>
+        {error && <p className="error" role="alert">{error}</p>}
+      </form>
+    );
+  return (
+    <div className="ws-title">
+      <h1>{workspace.name}</h1>
+      {isAdmin && (
+        <>
+          <button
+            className="link"
+            onClick={() => {
+              setName(workspace.name);
+              setError("");
+              setEditing(true);
+            }}
+          >
+            Rename
+          </button>
+          <button className="link" disabled={busy} onClick={remove}>
+            Delete workspace
+          </button>
+        </>
+      )}
+      {error && <p className="error" role="alert">{error}</p>}
     </div>
   );
 }
 
-function GuidePage({ workspace, isAdmin }: { workspace: Workspace; isAdmin: boolean }) {
+function GuidePage({ workspace, isAdmin, onLostAccess }: { workspace: Workspace; isAdmin: boolean; onLostAccess: () => void }) {
   const [guide, setGuide] = useState<Guide | null | undefined>(undefined);
   const [building, setBuilding] = useState<Section[] | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    api<Guide | null>(`/workspaces/${workspace.id}/guide`).then(setGuide).catch((e) => setError(e.message));
-  }, [workspace.id]);
+    api<Guide | null>(`/workspaces/${workspace.id}/guide`)
+      .then(setGuide)
+      .catch((e) => (lostAccess(e) ? onLostAccess() : setError(e.message)));
+  }, [workspace.id, onLostAccess]);
 
   async function build() {
     setBuilding([]);
@@ -64,7 +187,8 @@ function GuidePage({ workspace, isAdmin }: { workspace: Workspace; isAdmin: bool
       });
       setGuide(await api<Guide | null>(`/workspaces/${workspace.id}/guide`));
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not create the guide");
+      if (lostAccess(e)) onLostAccess();
+      else setError(errorText(e, "Could not create the guide"));
     }
     setBuilding(null);
   }
@@ -85,10 +209,15 @@ function GuidePage({ workspace, isAdmin }: { workspace: Workspace; isAdmin: bool
         {guide && !building && <p>Written from this workspace's documents on {day(guide.created_at)}. Update it after adding important documents.</p>}
         {building && <p role="status">Writing section {building.length + 1}. Each section is saved only when all are done.</p>}
         {error && <p className="error" role="alert">{error}</p>}
-        {isAdmin && guide !== undefined && (
-          <button className="primary" disabled={building !== null} onClick={build}>
-            {guide ? "Update the guide" : "Create the guide"}
-          </button>
+        {((isAdmin && guide !== undefined) || (guide?.stale && !building)) && (
+          <div className="row">
+            {isAdmin && guide !== undefined && (
+              <button className="primary" disabled={building !== null} onClick={build}>
+                {guide ? "Update the guide" : "Create the guide"}
+              </button>
+            )}
+            {guide?.stale && !building && <p className="stale">Documents changed since this guide was written.</p>}
+          </div>
         )}
       </div>
       {guide && !building && guide.reading_order.length > 0 && (
@@ -108,21 +237,54 @@ function GuidePage({ workspace, isAdmin }: { workspace: Workspace; isAdmin: bool
   );
 }
 
-function GapsPage({ workspace, onHandover }: { workspace: Workspace; onHandover: () => void }) {
+function GapsPage({
+  workspace,
+  isAdmin,
+  onLostAccess,
+  onHandover,
+}: {
+  workspace: Workspace;
+  isAdmin: boolean;
+  onLostAccess: () => void;
+  onHandover: () => void;
+}) {
   const [gaps, setGaps] = useState<Gap[] | null>(null);
   const [error, setError] = useState("");
+  const [dismissed, setDismissed] = useState<string[]>([]); // shown as "Dismissed" for a moment, then removed
+  const [failed, setFailed] = useState<{ question: string; text: string } | null>(null);
+  const [announce, setAnnounce] = useState("");
 
   useEffect(() => {
-    api<Gap[]>(`/workspaces/${workspace.id}/gaps`).then(setGaps).catch((e) => setError(e.message));
-  }, [workspace.id]);
+    api<Gap[]>(`/workspaces/${workspace.id}/gaps`)
+      .then(setGaps)
+      .catch((e) => (lostAccess(e) ? onLostAccess() : setError(e.message)));
+  }, [workspace.id, onLostAccess]);
+
+  async function dismiss(question: string) {
+    setFailed(null);
+    try {
+      await api(`/workspaces/${workspace.id}/gaps/dismiss`, post({ question }));
+      setDismissed((d) => [...d, question]);
+      setAnnounce(`Dismissed "${question}".`);
+      setTimeout(() => {
+        setGaps((all) => all?.filter((g) => g.question !== question) ?? all);
+        setDismissed((d) => d.filter((q) => q !== question));
+      }, 1500);
+    } catch (e) {
+      if (lostAccess(e)) onLostAccess();
+      else setFailed({ question, text: errorText(e, "Could not dismiss this question. Try again.") });
+    }
+  }
 
   return (
     <div className="kt">
       <div className="kt-intro">
         <h2>What the documents don't cover</h2>
         <p>Questions from the last 30 days that had no answer in the documents, or whose answer someone marked not helpful. Who asked is not shown.</p>
+        {isAdmin && <p>Dismiss a question that is not worth answering, such as a test or a typo. It stops showing here.</p>}
         {error && <p className="error" role="alert">{error}</p>}
       </div>
+      <p className="visually-hidden" role="status">{announce}</p>
       {gaps?.length === 0 && <p className="quiet">No gaps in the last 30 days.</p>}
       {gaps && gaps.length > 0 && (
         <>
@@ -133,6 +295,15 @@ function GapsPage({ workspace, onHandover }: { workspace: Workspace; onHandover:
                 <p className="meta">
                   {g.not_found ? "Not in the documents" : "Answer marked not helpful"}. Asked {g.asked === 1 ? "once" : `${g.asked} times`}, last on {day(g.last_asked)}.
                 </p>
+                {isAdmin &&
+                  (dismissed.includes(g.question) ? (
+                    <p className="meta">Dismissed</p>
+                  ) : (
+                    <button className="link dismiss" aria-label={`Dismiss "${g.question}"`} onClick={() => dismiss(g.question)}>
+                      Dismiss
+                    </button>
+                  ))}
+                {failed?.question === g.question && <p className="error" role="alert">{failed.text}</p>}
               </li>
             ))}
           </ul>
@@ -153,7 +324,7 @@ const STANDARD_QUESTIONS = [
   "Anything else a newcomer should know?",
 ];
 
-function HandoverPage({ workspace }: { workspace: Workspace }) {
+function HandoverPage({ workspace, onLostAccess }: { workspace: Workspace; onLostAccess: () => void }) {
   const [questions, setQuestions] = useState<{ q: string; gap: boolean }[] | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -164,8 +335,11 @@ function HandoverPage({ workspace }: { workspace: Workspace }) {
     const standard = STANDARD_QUESTIONS.map((q) => ({ q, gap: false }));
     api<Gap[]>(`/workspaces/${workspace.id}/gaps`)
       .then((gaps) => setQuestions([...gaps.slice(0, 8).map((g) => ({ q: g.question, gap: true })), ...standard]))
-      .catch(() => setQuestions(standard));
-  }, [workspace.id]);
+      .catch((e) => {
+        if (lostAccess(e)) onLostAccess();
+        setQuestions(standard);
+      });
+  }, [workspace.id, onLostAccess]);
 
   const filled = Object.values(answers).some((a) => a.trim());
 
@@ -181,7 +355,8 @@ function HandoverPage({ workspace }: { workspace: Workspace }) {
       setResult(`Saved as ${r.name}. Everyone with access to ${workspace.name} can now ask about it.`);
       setAnswers({});
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save the notes");
+      if (lostAccess(err)) onLostAccess();
+      else setError(errorText(err, "Could not save the notes"));
     }
     setBusy(false);
   }

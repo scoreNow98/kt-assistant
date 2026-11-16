@@ -10,6 +10,7 @@ export default function App({ health }: { health: Health }) {
   const [loadError, setLoadError] = useState("");
   const [selected, setSelected] = useState<number | null>(null);
   const [view, setView] = useState<"chat" | "team">("chat");
+  const [lost, setLost] = useState(""); // name of a workspace this person can no longer open
 
   const reload = useCallback(async () => {
     try {
@@ -81,10 +82,30 @@ export default function App({ health }: { health: Health }) {
         </div>
       </nav>
       <main>
+        {lost && (
+          <div className="lost-access" role="alert">
+            <p>You no longer have access to {lost}. Ask an admin if you still need it.</p>
+            <button className="link" onClick={() => setLost("")}>Close</button>
+          </div>
+        )}
         {view === "team" && me.role === "admin" ? (
           <Team workspaces={me.workspaces} />
         ) : workspace ? (
-          <WorkspaceView key={workspace.id} workspace={workspace} isAdmin={me.role === "admin"} />
+          <WorkspaceView
+            key={workspace.id}
+            workspace={workspace}
+            isAdmin={me.role === "admin"}
+            onChanged={reload}
+            onDeleted={async () => {
+              setSelected(null);
+              await reload();
+            }}
+            onLostAccess={() => {
+              setLost(workspace.name);
+              setSelected(null);
+              reload();
+            }}
+          />
         ) : (
           <div className="empty">
             <h1>No workspaces yet</h1>

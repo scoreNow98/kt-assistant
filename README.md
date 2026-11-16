@@ -4,9 +4,9 @@ Knowledge-transfer assistant for service teams: one workspace per client, answer
 
 Status: **phase 5, ready for a first paying pilot** (billing not built yet). Each client workspace has four tabs:
 
-- **Ask:** questions answered from the documents, with sources beside each answer (phase 3).
+- **Ask:** questions answered from the documents, with sources beside each answer (phase 3). A follow-up only counts within the same visit and 30 minutes, and the page shows when a question is being treated as a follow-up. An answer can be stopped, retried, or removed.
 - **Start here:** an onboarding guide an admin creates in one click: five cited sections and a reading order.
-- **Gaps:** questions from the last 30 days the documents could not answer, or whose answers were marked not helpful. Who asked is not shown.
+- **Gaps:** questions from the last 30 days the documents could not answer, or whose answers were marked not helpful. Who asked is not shown. A gap closes by itself once the question is asked again and answered. Admins can dismiss junk questions.
 - **Hand over:** someone leaving answers those gaps and a few standard questions; the answers are saved as a document that later answers cite.
 
 ## One-time setup
@@ -46,6 +46,12 @@ docker compose exec api python ingest.py you@example.com client-a /sample-data/c
 docker compose exec api python ingest.py you@example.com client-b /sample-data/client-b
 ```
 
+After an update that changes how documents are split, load them again with `--replace`:
+
+```bash
+docker compose exec api python ingest.py --replace you@example.com client-a /sample-data/client-a
+```
+
 Reload the page, open `client-a` and ask, for example, "How do I allow requests from a frontend on a different origin?".
 
 ## Who can see what
@@ -54,14 +60,28 @@ Reload the page, open `client-a` and ask, for example, "How do I allow requests 
 - A **member** sees only the workspaces an admin ticked for them.
 - Another company sees nothing. This is enforced twice: in the API, and in Postgres itself with row-level security (`apps/api/schema.sql`).
 
-Invites are links the admin copies and sends; the app does not send email. Admins can remove a document (in the document list of a workspace) and remove a person (under "Team and access"); a removed person is signed out at once.
+Invites are links the admin copies and sends; the app does not send email. An admin, or the person who added it, can remove a document (in the document list of a workspace). Admins can remove a person (under "Team and access"); a removed person is signed out at once.
+
+## Fixing mistakes
+
+- **Wrong document:** the person who added it or an admin removes it from the document list of the workspace. Uploading a changed file with the same name asks whether to replace the old one.
+- **Wrong file picked:** files of the wrong type, empty files and files over 20 MB are refused before upload, with a reason per file.
+- **Wrong workspace:** an admin can rename or delete it. Deleting removes its documents, questions and guide.
+- **Wrong question (or something pasted by mistake):** each person can remove their own question, or all of them, from a workspace. The text is erased; the question still counts toward the month's plan usage.
+- **Wrong invite or role:** pending invites can be revoked and a person's role changed under "Team and access".
+- **Junk in the gap report:** an admin can dismiss it.
 
 ## Check
 
 ```bash
 docker compose exec api pytest                           # includes the cross-company leak tests
-docker compose exec api python eval.py you@example.com   # do 30 test questions find the right document?
+docker compose exec api python eval.py you@example.com   # do the 30 answerable test questions find the right document?
+docker compose exec api python eval_answers.py you@example.com   # are the answers themselves right?
 ```
+
+`eval_answers.py` asks all 38 test questions with the real model. For the 30 answerable ones it checks that the answer contains a key fact, cites the right document and uses only real source numbers. For the 8 the documents cannot answer, it checks that the answer says so. It takes several minutes with a local model.
+
+`eval.py` now prints how close the best match was for each question and suggests a value for `MAX_DISTANCE`. This is an optional cut-off (set in `.env`) that makes the assistant answer "not found" without calling the model when nothing in the documents is close enough.
 
 ## Change the models
 
@@ -126,9 +146,10 @@ docker compose -f docker-compose.prod.yml exec ollama ollama pull gemma3:4b
 
 From the review of phase 5 (security, correctness and accuracy), still open:
 
-- Answers are grounded by the prompt only. The model always receives the best passages, even for a question the documents do not cover, so a small model can write a confident wrong answer. A relevance cut-off needs tuning on real data first.
-- `eval.py` checks that search finds the right page, not that answers are right.
-- Unanswered questions reach the gap report only when the model uses the exact English "could not find" sentence; answers marked not helpful always do.
+- Answers are grounded by the prompt only. The model always receives the best passages, even for a question the documents do not cover, so a small model can write a confident wrong answer. `MAX_DISTANCE` is the cut-off for this; it is off until tuned with `eval.py`.
+- Answer quality can now be measured with `eval_answers.py`, but it has not been run with the real model yet, so the scores are unknown.
+- An answer counts as "not found" when it says so or cites none of its sources; a confident wrong answer that cites a real source is still not caught.
+- At most 8 answers are written at once per API process (`MAX_CONCURRENT_ANSWERS`); beyond that people see "busy, try again".
 - Any company can sign up without verifying an email address, and signup reveals whether an email already has an account.
 - Uploaded documents can contain instructions aimed at the model; they can mislead answers within that workspace.
 

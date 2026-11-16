@@ -1,7 +1,10 @@
+import hashlib
 import json
 import logging
 import os
+import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
@@ -12,7 +15,7 @@ from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 import auth
 import rag
@@ -82,6 +85,38 @@ def model_server_error(request, exc):
     log.error("model server call failed: %r", exc)
     alert(f"KT Assistant cannot reach the model server at {rag.LLM_BASE_URL}.")
     return JSONResponse(status_code=502, content={"detail": model_down_message()})
+
+
+# ---------- answer slots ----------
+
+# shortcut: counted in memory by this one API process; share the count (Redis or the proxy) if you run several.
+MAX_CONCURRENT_ANSWERS = int(os.getenv("MAX_CONCURRENT_ANSWERS", "8"))
+_answer_slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANSWERS)
+
+
+def take_answer_slot() -> None:
+    """Refuses the request when MAX_CONCURRENT_ANSWERS answers or guides are being written already."""
+    if not _answer_slots.acquire(blocking=False):
+        raise HTTPException(429, "The assistant is busy. Try again in a moment.")
+
+
+def holding_slot(lines, slot=None):
+    """Streams lines and gives the answer slot back when they end, fail, or the client goes away.
+
+    Started here up to its first step, so even a response that is never read releases the slot when it is
+    closed or garbage-collected."""
+    slot = slot or _answer_slots
+
+    def run():
+        try:
+            yield ""
+            yield from lines
+        finally:
+            slot.release()
+
+    stream = run()
+    next(stream)
+    return StreamingResponse(stream, media_type="application/x-ndjson")
 
 
 # ---------- plans and usage ----------
@@ -273,11 +308,35 @@ def invite(body: InviteRequest, user: Admin):
     token, hashed = auth.new_token()
     with admin_db() as conn:
         require_room(conn, user["org_id"], "people")
-        conn.execute(
-            "INSERT INTO invites (token_hash, org_id, role, expires_at) VALUES (%s, %s, %s, now() + make_interval(days => %s))",
+        invite_id = conn.execute(
+            "INSERT INTO invites (token_hash, org_id, role, expires_at) VALUES (%s, %s, %s, now() + make_interval(days => %s)) "
+            "RETURNING id",
             (hashed, user["org_id"], body.role, auth.INVITE_DAYS),
-        )
-    return {"token": token, "valid_days": auth.INVITE_DAYS}
+        ).fetchone()[0]
+    return {"id": invite_id, "token": token, "valid_days": auth.INVITE_DAYS}
+
+
+@app.get("/invites")
+def pending_invites(user: Admin):
+    """Unused, unexpired invites, newest first. The links themselves cannot be shown again: only hashes are kept."""
+    with admin_db() as conn:
+        rows = conn.execute(
+            "SELECT id, role, expires_at FROM invites WHERE org_id = %s AND used_at IS NULL AND expires_at > now() "
+            "ORDER BY id DESC",
+            (user["org_id"],),
+        ).fetchall()
+    return [{"id": i, "role": r, "expires_at": e.isoformat()} for i, r, e in rows]
+
+
+@app.delete("/invites/{invite_id}")
+def revoke_invite(invite_id: int, user: Admin):
+    with admin_db() as conn:
+        removed = conn.execute(
+            "DELETE FROM invites WHERE id = %s AND org_id = %s", (invite_id, user["org_id"])
+        ).rowcount
+    if not removed:
+        raise HTTPException(404, "Invite not found")
+    return {"ok": True}
 
 
 @app.get("/usage")
@@ -298,6 +357,24 @@ def team(user: Admin):
     return [{"id": i, "email": e, "role": r, "workspace_ids": w, "you": i == user["id"]} for i, e, r, w in members]
 
 
+class RoleChange(BaseModel):
+    role: Literal["admin", "member"]
+
+
+@app.put("/team/{member_id}/role")
+def change_role(member_id: int, body: RoleChange, user: Admin):
+    """Takes effect on the person's next request; they stay signed in."""
+    if member_id == user["id"]:
+        raise HTTPException(400, "You cannot change your own role. Ask another admin.")
+    with admin_db() as conn:
+        changed = conn.execute(
+            "UPDATE users SET role = %s WHERE id = %s AND org_id = %s", (body.role, member_id, user["org_id"])
+        ).rowcount
+    if not changed:
+        raise HTTPException(404, "Person not found")
+    return {"ok": True}
+
+
 @app.delete("/team/{member_id}")
 def remove_person(member_id: int, user: Admin):
     """Removes someone from the company: their account, sessions, access and questions go; documents stay."""
@@ -313,20 +390,65 @@ def remove_person(member_id: int, user: Admin):
 
 
 class NewWorkspace(BaseModel):
-    name: str = Field(min_length=1, max_length=60)
+    name: str = Field(max_length=500)
+
+    @field_validator("name")
+    @classmethod
+    def tidy(cls, name: str) -> str:
+        name = " ".join(name.split())
+        if not 1 <= len(name) <= 60:
+            raise ValueError("Use a workspace name of 1 to 60 characters")
+        return name
+
+
+WORKSPACE_TAKEN = "A workspace with this name already exists. Choose another name."
+
+
+def name_taken(conn, user: dict, name: str, workspace_id: int = 0) -> bool:
+    # shortcut: checked before writing, so two admins naming workspaces "A" and "a" at the same moment can both
+    # pass; add a unique index on (org_id, lower(name)) once existing names have been checked for clashes.
+    return conn.execute(
+        "SELECT 1 FROM workspaces WHERE org_id = %s AND lower(name) = lower(%s) AND id <> %s",
+        (user["org_id"], name, workspace_id),
+    ).fetchone() is not None
 
 
 @app.post("/workspaces")
 def create_workspace(body: NewWorkspace, user: Admin):
     try:
         with user_db(user["session"]) as conn:
+            if name_taken(conn, user, body.name):
+                raise HTTPException(409, WORKSPACE_TAKEN)
             row = conn.execute(
                 "INSERT INTO workspaces (org_id, name) VALUES (%s, %s) RETURNING id, name",
-                (user["org_id"], body.name.strip()),
+                (user["org_id"], body.name),
             ).fetchone()
     except psycopg.errors.UniqueViolation:
-        raise HTTPException(409, "A workspace with this name already exists")
+        raise HTTPException(409, WORKSPACE_TAKEN)
     return {"id": row[0], "name": row[1]}
+
+
+@app.patch("/workspaces/{workspace_id}")
+def rename_workspace(workspace_id: int, body: NewWorkspace, user: Admin):
+    try:
+        with user_db(user["session"]) as conn:
+            open_workspace(conn, workspace_id)
+            if name_taken(conn, user, body.name, workspace_id):
+                raise HTTPException(409, WORKSPACE_TAKEN)
+            conn.execute("UPDATE workspaces SET name = %s WHERE id = %s", (body.name, workspace_id))
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, WORKSPACE_TAKEN)
+    return {"id": workspace_id, "name": body.name}
+
+
+@app.delete("/workspaces/{workspace_id}")
+def delete_workspace(workspace_id: int, user: Admin):
+    """Removes the workspace with its documents, questions (everyone's), guide and member list."""
+    with user_db(user["session"]) as conn:
+        open_workspace(conn, workspace_id)
+        if not conn.execute("DELETE FROM workspaces WHERE id = %s", (workspace_id,)).rowcount:
+            raise HTTPException(404, "Workspace not found")
+    return {"ok": True}
 
 
 @app.put("/workspaces/{workspace_id}/members/{member_id}")
@@ -364,7 +486,7 @@ class Turn(BaseModel):
 
 
 class Question(BaseModel):
-    question: str = Field(min_length=1, max_length=2000)
+    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
     history: list[Turn] = Field(default=[], max_length=2)
 
 
@@ -372,19 +494,57 @@ class Feedback(BaseModel):
     value: Literal[-1, 0, 1]  # 0 clears it
 
 
+def clean_file_name(name: str | None) -> str:
+    """Base name only, no control or invisible formatting characters, at most 200 characters (keeping the type)."""
+    name = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(c for c in name if unicodedata.category(c) not in ("Cc", "Cf")).strip()
+    if len(name) > 200:
+        stem, dot, suffix = name.rpartition(".")
+        name = stem[: 199 - len(suffix)] + dot + suffix if dot and len(suffix) <= 10 else name[:200]
+    return name or "upload"
+
+
 @app.post("/workspaces/{workspace_id}/documents")
-def upload(workspace_id: int, file: UploadFile, user: User):
+def upload(workspace_id: int, file: UploadFile, user: User, replace: bool = False):
+    """Adds a file. A different file with the same name is refused (409) unless replace=true and the caller
+    is an admin or uploaded the one already there; then the old one is swapped out in one transaction."""
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "This file is larger than 20 MB")
-    with admin_db() as conn:
-        require_room(conn, user["org_id"], "documents")
-    with user_db(user["session"]) as conn:
+    if not data:
+        raise HTTPException(400, "This file is empty.")
+    name = clean_file_name(file.filename)
+    sha256 = hashlib.sha256(data).hexdigest()
+    with user_db(user["session"]) as conn:  # one transaction: a replace that fails leaves the old document
         open_workspace(conn, workspace_id)
+        if conn.execute(
+            "SELECT 1 FROM documents d WHERE d.workspace_id = %s AND d.sha256 = %s "
+            "AND EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id AND c.embed_model = %s)",
+            (workspace_id, sha256, rag.EMBED_MODEL),
+        ).fetchone():
+            return {"name": name, "status": "duplicate", "chunks": 0}
+        same_name = "FROM documents WHERE workspace_id = %s AND name = %s AND sha256 <> %s"
+        owners = [r[0] for r in conn.execute(f"SELECT uploaded_by {same_name}", (workspace_id, name, sha256))]
+        if owners:
+            can_replace = user["role"] == "admin" or all(owner == user["id"] for owner in owners)
+            if not replace:
+                return JSONResponse(status_code=409, content={
+                    "detail": f'A document named "{name}" is already here. '
+                    + ("Replace it, or rename your file to keep both." if can_replace else
+                       "Only an admin or the person who added it can replace it. Rename your file to add it as well."),
+                    "can_replace": can_replace,
+                })
+            # The database refuses deleting someone else's document too; a short count means it did.
+            if not can_replace or conn.execute(f"DELETE {same_name}", (workspace_id, name, sha256)).rowcount != len(owners):
+                raise HTTPException(403, "Only an admin or the person who added this document can replace it.")
+        else:  # only a new document counts against the plan; a replace keeps the count
+            with admin_db() as room:
+                require_room(room, user["org_id"], "documents")
         try:
-            return rag.ingest(conn, workspace_id, file.filename or "upload", data)
+            result = rag.ingest(conn, workspace_id, name, data, uploaded_by=user["id"])
         except ValueError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e))  # also rolls back the removal of the old document
+    return result | {"status": "replaced"} if owners and result["status"] == "ready" else result
 
 
 @app.get("/workspaces/{workspace_id}/documents")
@@ -392,18 +552,30 @@ def documents(workspace_id: int, user: User):
     with user_db(user["session"]) as conn:
         open_workspace(conn, workspace_id)
         rows = conn.execute(
-            "SELECT d.id, d.name, count(c.id) FROM documents d LEFT JOIN chunks c ON c.document_id = d.id "
+            "SELECT d.id, d.name, count(c.id), d.created_at, d.uploaded_by = %s "
+            "FROM documents d LEFT JOIN chunks c ON c.document_id = d.id "
             "WHERE d.workspace_id = %s GROUP BY d.id ORDER BY d.name, d.id",
-            (workspace_id,),
+            (user["id"], workspace_id),
         ).fetchall()
-    return [{"id": i, "name": name, "chunks": chunks} for i, name, chunks in rows]
+    return [
+        {"id": i, "name": name, "chunks": chunks, "created_at": created.isoformat(), "yours": bool(yours)}
+        for i, name, chunks, created, yours in rows
+    ]
 
 
 @app.delete("/workspaces/{workspace_id}/documents/{document_id}")
-def delete_document(workspace_id: int, document_id: int, user: Admin):
-    """Removes a document and its chunks, for example one uploaded to the wrong client or out of date."""
+def delete_document(workspace_id: int, document_id: int, user: User):
+    """Removes a document and its chunks, for example one uploaded to the wrong client or out of date.
+    Admins may remove any document; others only the ones they uploaded (the database checks this too)."""
     with user_db(user["session"]) as conn:
         open_workspace(conn, workspace_id)
+        row = conn.execute(
+            "SELECT uploaded_by FROM documents WHERE id = %s AND workspace_id = %s", (document_id, workspace_id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Document not found")
+        if user["role"] != "admin" and row[0] != user["id"]:
+            raise HTTPException(403, "Only an admin or the person who added this document can remove it.")
         deleted = conn.execute(
             "DELETE FROM documents WHERE id = %s AND workspace_id = %s", (document_id, workspace_id)
         ).rowcount
@@ -414,7 +586,8 @@ def delete_document(workspace_id: int, document_id: int, user: Admin):
 
 @app.post("/workspaces/{workspace_id}/ask")
 def ask(workspace_id: int, body: Question, user: User):
-    """Streams newline-separated JSON: {searched_for, sources}, then {delta} pieces, then {done, message_id}.
+    """Streams newline-separated JSON: {searched_for, sources}, then {delta} pieces, then
+    {done, message_id, not_found}.
 
     Model errors before the first line become a normal 502; after it, an {error} line.
     """
@@ -422,9 +595,14 @@ def ask(workspace_id: int, body: Question, user: User):
         open_workspace(conn, workspace_id)
     with admin_db() as conn:
         require_room(conn, user["org_id"], "questions")
-    with user_db(user["session"]) as conn:
-        standalone = rag.rewrite(body.question, [t.model_dump() for t in body.history])
-        sources = rag.fit(rag.search(conn, workspace_id, standalone))
+    take_answer_slot()
+    try:
+        with user_db(user["session"]) as conn:
+            standalone = rag.rewrite(body.question, [t.model_dump() for t in body.history])
+            sources = rag.fit(rag.search(conn, workspace_id, standalone))
+    except BaseException:
+        _answer_slots.release()
+        raise
 
     def lines():
         yield json.dumps({"searched_for": standalone, "sources": sources}) + "\n"
@@ -443,15 +621,16 @@ def ask(workspace_id: int, body: Question, user: User):
             alert("KT Assistant: an answer failed while streaming. See the API logs.")
             yield json.dumps({"error": "The answer failed part way. Try again."}) + "\n"
             return
+        not_found = rag.is_not_found(answer, sources)
         with user_db(user["session"]) as conn:
             message_id = conn.execute(
-                "INSERT INTO messages (workspace_id, user_id, question, searched_for, answer, sources) "
-                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-                (workspace_id, user["id"], body.question, standalone, answer, Jsonb(sources)),
+                "INSERT INTO messages (workspace_id, user_id, question, searched_for, answer, sources, not_found) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (workspace_id, user["id"], body.question, standalone, answer, Jsonb(sources), not_found),
             ).fetchone()[0]
-        yield json.dumps({"done": True, "message_id": message_id}) + "\n"
+        yield json.dumps({"done": True, "message_id": message_id, "not_found": not_found}) + "\n"
 
-    return StreamingResponse(lines(), media_type="application/x-ndjson")
+    return holding_slot(lines())
 
 
 @app.get("/workspaces/{workspace_id}/messages")
@@ -460,19 +639,45 @@ def messages(workspace_id: int, user: User):
     with user_db(user["session"]) as conn:
         open_workspace(conn, workspace_id)
         rows = conn.execute(
-            "SELECT * FROM (SELECT id, question, searched_for, answer, sources, feedback FROM messages "
-            "WHERE workspace_id = %s ORDER BY id DESC LIMIT 20) recent ORDER BY id",
+            "SELECT * FROM (SELECT id, question, searched_for, answer, sources, feedback, not_found, created_at "
+            "FROM messages WHERE workspace_id = %s AND NOT removed ORDER BY id DESC LIMIT 20) recent ORDER BY id",
             (workspace_id,),
         ).fetchall()
-    keys = ("id", "question", "searched_for", "answer", "sources", "feedback")
-    return [dict(zip(keys, row)) for row in rows]
+    keys = ("id", "question", "searched_for", "answer", "sources", "feedback", "not_found", "created_at")
+    return [dict(zip(keys, row[:-1] + (row[-1].isoformat(),))) for row in rows]
+
+
+# Removing wipes the text but keeps the row, so this month's question count (usage) does not go down.
+WIPE_MESSAGES = (
+    "UPDATE messages SET removed = true, question = '', searched_for = '', answer = '', sources = '[]'::jsonb, "
+    "feedback = NULL WHERE user_id = %(u)s AND NOT removed AND "
+)
+
+
+@app.delete("/workspaces/{workspace_id}/messages")
+def clear_messages(workspace_id: int, user: User):
+    """Removes the caller's own questions in this workspace; other people's stay."""
+    with user_db(user["session"]) as conn:
+        open_workspace(conn, workspace_id)
+    with admin_db() as conn:  # kt_app may not change messages; filtered to the caller's own here
+        deleted = conn.execute(WIPE_MESSAGES + "workspace_id = %(w)s", {"u": user["id"], "w": workspace_id}).rowcount
+    return {"ok": True, "deleted": deleted}
+
+
+@app.delete("/messages/{message_id}")
+def delete_message(message_id: int, user: User):
+    with admin_db() as conn:  # kt_app may not change messages; filtered to the caller's own here
+        deleted = conn.execute(WIPE_MESSAGES + "id = %(m)s", {"u": user["id"], "m": message_id}).rowcount
+    if not deleted:
+        raise HTTPException(404, "Message not found")
+    return {"ok": True}
 
 
 @app.put("/messages/{message_id}/feedback")
 def feedback(message_id: int, body: Feedback, user: User):
     with user_db(user["session"]) as conn:
         updated = conn.execute(
-            "UPDATE messages SET feedback = NULLIF(%s, 0) WHERE id = %s", (body.value, message_id)
+            "UPDATE messages SET feedback = NULLIF(%s, 0) WHERE id = %s AND NOT removed", (body.value, message_id)
         ).rowcount
     if not updated:
         raise HTTPException(404, "Message not found")
@@ -482,8 +687,6 @@ def feedback(message_id: int, body: Feedback, user: User):
 # ---------- knowledge transfer ----------
 
 GAP_DAYS = 30
-# The answer prompt asks for this sentence when the documents lack the answer; small models sometimes add to it.
-NOT_FOUND_PATTERN = "%could not find this in the documents%"
 
 GUIDE_SECTIONS = [
     ("What this is", "What is this project or system, and what does it do?"),
@@ -497,17 +700,23 @@ GUIDE_SECTIONS = [
 @app.get("/workspaces/{workspace_id}/gaps")
 def gaps(workspace_id: int, user: User):
     """Questions from the last 30 days that the documents could not answer or that someone marked
-    not helpful. Shared with everyone who can open the workspace, without saying who asked."""
+    not helpful. Shared with everyone who can open the workspace, without saying who asked.
+
+    A question drops off when an admin dismissed it, or when the last time it was asked it was answered
+    and not marked not helpful (for example after someone handed the answer over)."""
     with user_db(user["session"]) as conn:
         open_workspace(conn, workspace_id)
     with admin_db() as conn:  # reads every member's questions; access was checked just above
         rows = conn.execute(
-            "SELECT min(searched_for), count(*), max(created_at), "
-            "coalesce(bool_or(answer ILIKE %(nf)s), false), coalesce(bool_or(feedback = -1), false) "
-            "FROM messages WHERE workspace_id = %(w)s AND created_at > now() - make_interval(days => %(days)s) "
-            "AND (answer ILIKE %(nf)s OR feedback = -1) "
-            "GROUP BY lower(searched_for) ORDER BY count(*) DESC, max(created_at) DESC LIMIT 50",
-            {"nf": NOT_FOUND_PATTERN, "w": workspace_id, "days": GAP_DAYS},
+            "SELECT min(searched_for), count(*) FILTER (WHERE not_found OR feedback = -1), max(created_at), "
+            "bool_or(not_found), coalesce(bool_or(feedback = -1), false) "
+            "FROM messages WHERE workspace_id = %(w)s AND NOT dismissed AND NOT removed "
+            "AND workspace_id IN (SELECT id FROM workspaces WHERE org_id = %(org)s) "
+            "AND created_at > now() - make_interval(days => %(days)s) "
+            "GROUP BY lower(searched_for) "
+            "HAVING (array_agg(not_found OR feedback IS NOT DISTINCT FROM -1 ORDER BY created_at DESC, id DESC))[1] "
+            "ORDER BY 2 DESC, max(created_at) DESC LIMIT 50",
+            {"w": workspace_id, "org": user["org_id"], "days": GAP_DAYS},
         ).fetchall()
     return [
         {"question": q, "asked": n, "last_asked": last.isoformat(), "not_found": nf, "not_helpful": nh}
@@ -515,14 +724,45 @@ def gaps(workspace_id: int, user: User):
     ]
 
 
+class Dismiss(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+
+
+@app.post("/workspaces/{workspace_id}/gaps/dismiss")
+def dismiss_gap(workspace_id: int, body: Dismiss, user: Admin):
+    """Takes a question off the gap report, for example a junk or off-topic one. Asked again later, it can return."""
+    with user_db(user["session"]) as conn:
+        open_workspace(conn, workspace_id)
+    with admin_db() as conn:  # marks every member's questions; access was checked just above
+        dismissed = conn.execute(
+            "UPDATE messages SET dismissed = true WHERE workspace_id = %s AND NOT dismissed "
+            "AND workspace_id IN (SELECT id FROM workspaces WHERE org_id = %s) AND lower(searched_for) = lower(%s)",
+            (workspace_id, user["org_id"], body.question),
+        ).rowcount
+    return {"ok": True, "dismissed": dismissed}
+
+
+def document_ids(conn, workspace_id: int) -> list[int]:
+    return [r[0] for r in conn.execute("SELECT id FROM documents WHERE workspace_id = %s ORDER BY id", (workspace_id,))]
+
+
 @app.get("/workspaces/{workspace_id}/guide")
 def guide(workspace_id: int, user: User):
+    """The saved guide; stale is true when documents were added or removed since it was written."""
     with user_db(user["session"]) as conn:
         open_workspace(conn, workspace_id)
         row = conn.execute(
-            "SELECT sections, reading_order, created_at FROM guides WHERE workspace_id = %s", (workspace_id,)
+            "SELECT sections, reading_order, created_at, document_ids, "
+            "EXISTS (SELECT 1 FROM documents d WHERE d.workspace_id = g.workspace_id AND d.created_at > g.created_at) "
+            "FROM guides g WHERE workspace_id = %s",
+            (workspace_id,),
         ).fetchone()
-    return {"sections": row[0], "reading_order": row[1], "created_at": row[2].isoformat()} if row else None
+        if not row:
+            return None
+        sections, reading_order, created_at, written_from, newer = row
+        # Guides saved before document_ids existed can only tell additions.
+        stale = newer if written_from is None else written_from != document_ids(conn, workspace_id)
+    return {"sections": sections, "reading_order": reading_order, "created_at": created_at.isoformat(), "stale": stale}
 
 
 @app.post("/workspaces/{workspace_id}/guide")
@@ -530,8 +770,10 @@ def create_guide(workspace_id: int, user: Admin):
     """Streams one {section} line per finished section, then {done}. Saves only a complete guide."""
     with user_db(user["session"]) as conn:
         open_workspace(conn, workspace_id)
-        if not conn.execute("SELECT 1 FROM documents WHERE workspace_id = %s LIMIT 1", (workspace_id,)).fetchone():
-            raise HTTPException(400, "Add documents to this workspace first.")
+        written_from = document_ids(conn, workspace_id)
+    if not written_from:
+        raise HTTPException(400, "Add documents to this workspace first.")
+    take_answer_slot()
 
     def lines():
         sections = []
@@ -561,14 +803,14 @@ def create_guide(workspace_id: int, user: Admin):
                     reading_order.append(by_number[n])
         with user_db(user["session"]) as conn:
             conn.execute(
-                "INSERT INTO guides (workspace_id, sections, reading_order) VALUES (%s, %s, %s) "
+                "INSERT INTO guides (workspace_id, sections, reading_order, document_ids) VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT (workspace_id) DO UPDATE SET sections = excluded.sections, "
-                "reading_order = excluded.reading_order, created_at = now()",
-                (workspace_id, Jsonb(sections), Jsonb(reading_order)),
+                "reading_order = excluded.reading_order, document_ids = excluded.document_ids, created_at = now()",
+                (workspace_id, Jsonb(sections), Jsonb(reading_order), written_from),
             )
         yield json.dumps({"done": True, "reading_order": reading_order}) + "\n"
 
-    return StreamingResponse(lines(), media_type="application/x-ndjson")
+    return holding_slot(lines())
 
 
 class HandoverAnswer(BaseModel):
@@ -587,14 +829,16 @@ def handover(workspace_id: int, body: Handover, user: User):
     if not filled:
         raise HTTPException(400, "Write at least one answer before saving")
     now = datetime.now(timezone.utc)
-    text = f"# Handover notes from {user['email']}, {now:%d %b %Y}\n\n" + "\n\n".join(
+    author = user["email"].split("@")[0]  # the heading is part of every cited passage: no full email address
+    text = f"# Handover notes from {author}, {now:%d %b %Y}\n\n" + "\n\n".join(
         f"## {' '.join(a.question.split())}\n\n{a.answer.strip()}" for a in filled
     )
     with admin_db() as conn:
         require_room(conn, user["org_id"], "documents")
     with user_db(user["session"]) as conn:
         open_workspace(conn, workspace_id)
-        return rag.ingest(conn, workspace_id, f"handover/{user['email'].split('@')[0]}-{now:%Y-%m-%d-%H%M}.md", text.encode())
+        name = f"handover/{author}-{now:%Y-%m-%d-%H%M}.md"
+        return rag.ingest(conn, workspace_id, name, text.encode(), uploaded_by=user["id"])
 
 
 @app.get("/health")
